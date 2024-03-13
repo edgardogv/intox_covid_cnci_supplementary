@@ -1,0 +1,1758 @@
+---
+title: "Análisis de Intoxicaciones Reportadas por Drogas de Abuso"
+author: "Edgardo Gutiérrez Vega"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    downcute_theme: "chaos"
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 99)
+read_folder <- "datos_procesados"
+save_graficos <- "resultados_graficos"
+causa_ref <- "Adicción"
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(gtsummary)
+library(sf)
+library(FactoMineR)
+library(factoextra)
+source("R/tibl_to_ts.R")
+source("R/ggplot_ts.R")
+source("R/plot_map.R")
+source("R/get_ts_from_agg_df.R")
+source("R/get_arima_model.R")
+source("R/get_change_points.R")
+source("R/generate_counts.R")
+source("R/generate_counts_v2.R")
+source("R/generate_dtw_cluster_plot.R")
+source("R/analisis_correspondencia.R")
+source("R/get_cumulative_frequencies.R")
+source("R/generate_prophet_forecast.R")
+source("R/gg_arma_spanish.R")
+source("R/gg_tsresiduals_spanish.R")
+source("R/gg_tsdisplay_spanish.R")
+library(fable)
+library(feasts)
+img_folder <- "0.documento_final/img_finales/4.Adiccion"
+tab_folder <- "0.documento_final/tab_finales/4.Adiccion"
+intox_adi <- read_rds(file.path(read_folder, "intox_adiccion.RDS"))
+pob_year_sexo_ge_canton <- read_rds(file.path(read_folder, "pob_data.RDS"))
+meds <- read_rds(file.path(read_folder, "meds.RDS"))
+cantones_st <- read_rds(file.path(read_folder, "cantones_st.RDS"))
+table_count <- 1
+summary_arima_mods <- tibble()
+```
+
+## Análisis Intoxicaciones Drogas de Abuso
+  
+### Procesamiento de datos de drogas de abuso  
+  
+En el caso de las intoxicaciones por adicción, el Cuadro  `r table_count` muestra que los grupos principales de interés con los que se reporta este tipo de intoxicaciones son las drogas de abuso, con más de 7 mil casos, equivalente a casi un 88% de los casos relacionados a esta causa.
+  
+```{r}
+intox_adi$TOXICO_INTERES1 %>% table %>% prop.table() %>% sort
+
+intox_adi_freq_table <- get_cumulative_frequencies(intox_adi, "TOXICO_INTERES1")
+
+table_count <- table_count + 1
+
+intox_adi_freq_table %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+
+(intox_adi_toxicos <- get_cumulative_frequencies(intox_adi, "TOXICO_INTERES1") %>% 
+  mutate(
+    TOXICO_INTERES1 = case_when(
+      TOX_FREQ < 1.5 ~ "Otros",
+      TRUE ~ TOXICO_INTERES1
+    )
+  ) %>% 
+  group_by(TOXICO_INTERES1) %>% 
+  summarise(
+    TOX_N = sum(TOX_N),
+    TOX_FREQ = sum(TOX_FREQ)
+  ) %>%
+  arrange(desc(TOX_FREQ)) %>% 
+  arrange(TOXICO_INTERES1 == "Otros") %>% 
+  mutate(TOX_FREQ_CUMSUM = cumsum(TOX_FREQ)) %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  rename(
+    `Tipo de Tóxico Principal` = TOXICO_INTERES1,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+intox_adi_toxicos %>% 
+  gt::gtsave(file.path(tab_folder, "4.1.Adiccion.rtf"))
+intox_adi_toxicos %>% 
+  gt::gtsave(file.path(tab_folder, "4.1.Adiccion.tex"))
+```
+  
+Dado lo anterior, enfocamos el análisis en el grupo de drogas de abuso. El Cuadro `r table_count` presenta los conteos por año según sexo, grupo etario y tóxico de interés. Se observó que los hombres tienen una tendencia superior a reportar intoxicaciones por esta causa, llegando más del doble de los casos reportados por mujeres durante el 2021 y 2022. El grupo etario con edades entre los 20 y 24 años consistió en el mayor grupo con reportes de intoxicación con drogas de abuso a lo largo de todos los años, seguido por el grupo de 15 a 19 años. Tomando en cuenta estas frecuencias, se procedió a generar grupos etarios más generales para las otras edades, y se dejaron por fuera casos menores a 12 años.     
+  
+```{r fig.width=10}
+intox_adi_fltd <- intox_adi %>% 
+  filter(TOXICO_INTERES1 == "Drogas de Abuso")
+
+table_count <- table_count + 1
+
+intox_adi_fltd %>%
+  select(YEAR, SEXO, GRUPO_ETARIO) %>% 
+       tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(GRUPO_ETARIO ~ "Grupo Etario",
+                     SEXO ~ "Sexo"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**")
+```         
+  
+El Cuadro `r table_count` presenta las proporciones actualizadas por año según los nuevos grupos etarios. Con este arreglo, los grupos principales son el de 20 a 29 años y el de 30 a 39 años.  
+  
+```{r}
+intox_adi_fltd <- intox_adi_fltd %>% 
+  # filter(EDAD_A >= 12) %>% 
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      EDAD_A < 12 ~ "Menor a 12 años",
+      EDAD_A >= 12 & EDAD_A < 20 ~ "12 a 19 años",
+      GRUPO_ETARIO %in% c("20 a 24 años", "25 a 29 años") ~ "20 a 29 años",
+      GRUPO_ETARIO %in% c("30 a 34 años", "35 a 39 años") ~ "30 a 39 años",
+      GRUPO_ETARIO %in% c("40 a 44 años", "45 a 49 años") ~ "40 a 49 años",
+      GRUPO_ETARIO %in% c("50 a 54 años", "55 a 59 años", "60 a 64 años") ~ "50 a 64 años",
+      TRUE ~ "Mayor a 65 años"
+    )
+  )
+
+table_count <- table_count + 1
+
+(adi_summ <- intox_adi_fltd %>%
+  select(YEAR, SEXO, GRUPO_ETARIO2) %>% 
+       tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(GRUPO_ETARIO2 ~ "Grupo Etario",
+                     SEXO ~ "Sexo"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**") %>% 
+    as_gt())
+
+adi_summ %>% 
+  gt::gtsave(file.path(tab_folder, "4.2.Adiccion.rtf"))
+adi_summ %>% 
+  gt::gtsave(file.path(tab_folder, "4.2.Adiccion.tex"))
+```  
+  
+El Cuadro `r table_count` presenta el detalle de los tóxicos específicos relacionados con los reportes de intoxicación por adicción, siendo el alcohol y la marihuana los principales tóxicos reportados con aproximadamente el 74% de los casos totales en todo el período analizado.  
+  
+```{r}
+table_count <- table_count + 1
+
+intox_adi_fltd <- intox_adi_fltd %>% 
+  filter(EDAD_A >= 12) 
+
+get_cumulative_frequencies(intox_adi_fltd, "TOXICO1") %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+
+(intox_adi_toxicos <- get_cumulative_frequencies(intox_adi, "TOXICO1") %>% 
+  mutate(
+    TOXICO1 = case_when(
+      TOX_FREQ < 1 ~ "Otros",
+      TRUE ~ TOXICO1
+    )
+  ) %>% 
+  group_by(TOXICO1) %>% 
+  summarise(
+    TOX_N = sum(TOX_N),
+    TOX_FREQ = sum(TOX_FREQ)
+  ) %>%
+  arrange(desc(TOX_FREQ)) %>% 
+  arrange(TOXICO1 == "Otros") %>% 
+  mutate(TOXICO1 = str_to_title(TOXICO1)) %>% 
+  mutate(TOX_FREQ_CUMSUM = cumsum(TOX_FREQ)) %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  rename(
+    `Tóxico Principal` = TOXICO1,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+intox_adi_toxicos %>% 
+  gt::gtsave(file.path(tab_folder, "4.3.Adiccion.rtf"))
+intox_adi_toxicos %>% 
+  gt::gtsave(file.path(tab_folder, "4.3.Adiccion.tex"))
+```  
+  
+## Dynamic Time Warping Clustering - Drogas de Abuso  
+  
+https://damien-datasci-blog.netlify.app/post/time-series-clustering-with-dynamic-time-warp/  
+  
+### DTW - Drogas de Abuso - Edad y Sexo   
+  
+```{r fig.width=10, fig.height=15}
+agg_intox_adi_std <- generate_counts2(
+  intox_adi_fltd, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_adi <- generate_counts2(
+  intox_adi_fltd, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_adi_std, k_clusters = 2)
+generate_dtw_cluster_plot(agg_intox_adi, k_clusters = 2)
+
+png(filename = file.path(img_folder, "1.1.Adiccion_estadarizado.png"),
+    width = 720, height = 650, units = "px")
+generate_dtw_cluster_plot(agg_intox_adi_std, k_clusters = 4, lab_y = "Totales Estandarizados")
+dev.off()
+png(filename = file.path(img_folder, "1.1.Adiccion_original.png"),
+    width = 920, height = 650, units = "px")
+generate_dtw_cluster_plot(agg_intox_adi, k_clusters = 2, lab_y = "Total de Casos Reportados")  
+dev.off()
+
+# Hombres mayor a 40 años
+# Hombres 20 a 39 años
+# Hombres 12 a 19 años
+
+# Mujeres mayor a 50 años
+# Mujeres 12 a 19 años
+# Mujeres 20 a 40 años
+# Mujeres 40 a 50 años
+
+intox_adi_fltd2 <- intox_adi_fltd %>% 
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      SEXO == "Masculino" & GRUPO_ETARIO2 %in% c("20 a 29 años", "30 a 39 años") ~ "20 a 39 años",
+      SEXO == "Masculino" & GRUPO_ETARIO2 %in% c("40 a 49 años", "50 a 64 años", "Mayor a 65 años") ~ "Mayor a 40 años",
+      SEXO == "Femenino" & GRUPO_ETARIO2 %in% c("20 a 29 años", "30 a 39 años") ~ "20 a 39 años",
+      SEXO == "Femenino" & GRUPO_ETARIO2 %in% c("50 a 64 años", "Mayor a 65 años") ~ "Mayor a 50 años",
+      TRUE ~ GRUPO_ETARIO2
+    )
+  )
+
+agg_intox_adi_std2 <- generate_counts2(
+  intox_adi_fltd2, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_adi2 <- generate_counts2(
+  intox_adi_fltd2, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_adi_std2, k_clusters = 2)
+generate_dtw_cluster_plot(agg_intox_adi2, k_clusters = 2)
+
+# Mujeres mayor a 40 años
+# Hombres Mayor a 20 años
+
+intox_adi_fltd3 <- intox_adi_fltd2 %>% 
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      SEXO == "Masculino" & GRUPO_ETARIO2 %in% c("20 a 39 años", "Mayor a 40 años") ~ "Mayor a 20 años",
+      SEXO == "Femenino" & GRUPO_ETARIO2 %in% c("40 a 49 años", "Mayor a 50 años") ~ "Mayor a 40 años",
+      TRUE ~ GRUPO_ETARIO2
+    )
+  )
+
+agg_intox_adi_std3 <- generate_counts2(
+  intox_adi_fltd3, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_adi3 <- generate_counts2(
+  intox_adi_fltd3, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_adi_std3, k_clusters = 2)
+generate_dtw_cluster_plot(agg_intox_adi3, k_clusters = 2)
+
+intox_adi_fltd4 <- intox_adi_fltd3 %>% 
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      SEXO == "Femenino" & GRUPO_ETARIO2 %in% c("20 a 39 años", "Mayor a 40 años") ~ "Mayor a 20 años",
+      TRUE ~ GRUPO_ETARIO2
+    )
+  )
+
+agg_intox_adi_std4 <- generate_counts2(
+  intox_adi_fltd4, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_adi4 <- generate_counts2(
+  intox_adi_fltd4, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_adi_std4, k_clusters = 2)
+generate_dtw_cluster_plot(agg_intox_adi4, k_clusters = 2)
+
+# Mayores a 20 años
+# 12 a 19 años
+
+intox_adi_fltd4 <- intox_adi_fltd4 %>% 
+  mutate(
+    SEXO_GE = paste(SEXO, "-", GRUPO_ETARIO2)
+  )
+
+get_cumulative_frequencies(intox_adi_fltd4, "SEXO_GE") %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+```  
+  
+```{r}
+teens_adi_data <- intox_adi_fltd4 %>% 
+  filter(EDAD_A <= 19 & EDAD_A >= 12)
+
+(teens_adi_data %>%
+  select(YEAR, TOXICO1) %>% 
+  tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(TOXICO1 = "Tóxico Principal"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**"))
+```  
+
+```{r}
+adu_adi_data <- intox_adi_fltd4 %>% 
+  filter(EDAD_A >= 20)
+
+(adu_adi_data %>%
+  select(YEAR, TOXICO1) %>% 
+  tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(TOXICO1 = "Tóxico Principal"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**"))
+```  
+  
+## Drogas de Abuso - 12 a 19 años
+
+```{r}
+teens_adi <- get_ts_from_agg_df(agg_intox_adi4, 
+                                 filtro_etario = "12 a 19 años")
+
+(adi_teens_prop <- sum(teens_adi$ts_full)/nrow(intox_adi))
+
+teens_adi_tsibble <- teens_adi$agg_data %>% 
+  as_tsibble(index = TIEMPO) %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO))
+
+teens_adi_train <- teens_adi_tsibble %>% 
+  filter(TIEMPO < tsibble::yearmonth("2020-03"))
+teens_adi_test <- teens_adi_tsibble %>% 
+  filter(TIEMPO >= tsibble::yearmonth("2020-03"))
+```
+
+### Changepoint - Enfoque cambio de nivel
+
+```{r}
+teens_adi_cpts <- get_change_points(teens_adi$ts_full)
+teens_adi_cpts$cp_plot
+```
+  
+### ARIMA - Enfoque Intervencion  
+  
+#### Estacionariedad y Autocorrelogramas Intervención   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+# DescTools::PlotACF(teens_adi$ts_full, main = "")
+
+teens_adi_tsibble %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+teens_adi_tsibble |>
+  features(TOTAL, unitroot_nsdiffs)
+
+teens_adi_tsibble |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+teens_adi_tsibble |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+teens_adi_tsibble |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+teens_adi_tsibble |>
+  gg_tsdisplay(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+teens_adi_tsibble |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  labs(title = "Diferenciado", y="")
+
+png(filename = file.path(img_folder, "4.3.Adiccion_teens.png"),
+    width = 720, height = 480, units = "px")
+teens_adi_tsibble |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  ylab("Total Diferenciado (1)")
+dev.off()
+```  
+  
+#### Modelaje Intervención  
+  
+##### Selección del Modelo  
+  
+```{r}
+inter <- c(rep(0, 62), rep(1, 34))
+timeperiod <- 96
+
+# teens_adi_inter_model <- teens_adi_tsibble %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE))
+
+teens_adi_inter_model <- teens_adi_tsibble %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_010 = ARIMA(TOTAL ~ pdq(0,1,0) + inter),
+    arima_110 = ARIMA(TOTAL ~ pdq(1,1,0) + inter),
+    arima_011_auto = ARIMA(TOTAL ~ pdq(0,1,1) + inter),
+    arima_111 = ARIMA(TOTAL ~ pdq(1,1,1) + inter),
+    arima_210 = ARIMA(TOTAL ~ pdq(2,1,0) + inter),
+    arima_211 = ARIMA(TOTAL ~ pdq(2,1,1) + inter),
+    arima_310 = ARIMA(TOTAL ~ pdq(3,1,0) + inter),
+    arima_311 = ARIMA(TOTAL ~ pdq(3,1,1) + inter),
+    arima_312 = ARIMA(TOTAL ~ pdq(3,1,2) + inter),
+    
+    arima_010_100_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_110_100_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_011_100_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_111_100_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_210_100_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_211_100_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_310_100_12 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_311_100_12 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_312_100_12 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(1,0,0, period = 12) + inter)
+  )
+
+teens_adi_inter_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(teens_adi_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(teens_adi_arima_table <- glance(teens_adi_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ))
+
+teens_adi_arima_int_gt <- teens_adi_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+teens_adi_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.4.Adiccion_teens_arima_int.rtf"))
+teens_adi_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.4.Adiccion_teens_arima_int.tex"))
+
+teens_adi_inter_sel_model <- teens_adi_inter_model |>
+  select(arima_011_auto)
+
+teens_adi_inter_sel_model |>
+  report()
+
+teens_adi_inter_sel_model |> 
+  gg_tsresiduals(lag=timeperiod)
+
+adi_teens_arima_gt <- teens_adi_inter_sel_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "inter" ~ "Intervención",
+      term == "intercept" ~ "Intercepto",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+adi_teens_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.5.Adiccion_teens_arima_int_mod.rtf"))
+adi_teens_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.5.Adiccion_teens_arima_int_mod.tex"))
+
+teens_adi_inter_sel_model |> 
+  gg_tsresiduals(lag=timeperiod)
+
+png(filename = file.path(img_folder, "4.5.Adiccion_teens_int_resids.png"),
+    width = 720, height = 480, units = "px")
+teens_adi_inter_sel_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+```
+  
+##### Verificación de Supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(teens_adi_inter_lb <- augment(teens_adi_inter_model) |>
+  filter(.model == "arima_011_auto") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 1))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+  
+###### Raíces Unitarias  
+  
+```{r}
+teens_adi_inter_sel_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "4,4,Adiccion_teens_int_roots.png"),
+    width = 720, height = 480, units = "px")
+teens_adi_inter_sel_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+  
+###### Normalidad de los residuos  
+  
+```{r}
+# Normalidad de Residuos - ARIMA
+teens_adi_inter_ts_residuals <- residuals(teens_adi_inter_sel_model, 
+                                    type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(teens_adi_inter_ts_residuals)
+
+(teens_adi_inter_jb_arima <- tseries::jarque.bera.test(teens_adi_inter_ts_residuals))
+
+(teens_adi_inter_shap_arima <-shapiro.test(teens_adi_inter_ts_residuals))
+
+car::qqPlot(teens_adi_inter_ts_residuals)
+
+# Normalidad de residuos - Regresion
+teens_adi_inter_reg_residuals <- residuals(teens_adi_inter_sel_model, type = "regression") %>% as_tibble() %>% pull(.resid)
+
+mean(teens_adi_inter_reg_residuals)
+
+(teens_adi_inter_shap_reg <- shapiro.test(teens_adi_inter_reg_residuals))
+
+car::qqPlot(teens_adi_inter_reg_residuals)
+
+# Visualizacion ambos graficos
+bind_rows(
+    `Regression residuals` =
+        as_tibble(residuals(teens_adi_inter_sel_model, type = "regression")),
+    `ARIMA residuals` =
+        as_tibble(residuals(teens_adi_inter_sel_model, type = "innovation")),
+    .id = "type"
+  ) |>
+  mutate(
+    TIEMPO = as_date(TIEMPO)
+  ) |>
+  ggplot(aes(x = TIEMPO, y = .resid)) +
+  geom_line() +
+  facet_grid(vars(type))
+```
+  
+##### Agrupación de resultados  
+  
+```{r}
+(summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Adicción por Drogas de Abuso",
+    Población = "12 a 19 años",
+    Enfoque = "Intervención",
+    Modelo = "Regresion con ARIMA (0,1,1)",
+    # Significancia_intervencion = "No",
+    # ACF_Residuales = "Todos dentro",
+    # Histograma = "Sesgado a la derecha por un valor extremo",
+    Residuals_LJung_Box_Test_ARIMA = round(teens_adi_inter_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(teens_adi_inter_jb_arima$p.value, 2),
+    # Residuals_Shapiro_Test_ARIMA = round(teens_adi_inter_shap_arima$p.value, 2),
+    Residuals_Shapiro_Wilk_Regression = round(teens_adi_inter_shap_reg$p.value, 2)
+  )))
+```
+  
+#### ARIMA - Enfoque Pronostico  
+  
+#### Estacionariedad y Autocorrelogramas Pronóstico   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+teens_adi_train %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+teens_adi_train |>
+  features(TOTAL, unitroot_nsdiffs)
+
+teens_adi_train |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+teens_adi_train |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+teens_adi_train |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+teens_adi_train |>
+  gg_tsdisplay(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+png(filename = file.path(img_folder, "4.6.Adiccion_pron_dif.png"),
+    width = 720, height = 480, units = "px")
+teens_adi_train |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  ylab("Total Diferenciado (1)")
+dev.off()
+```    
+  
+#### Modelaje Pronóstico     
+  
+##### Selección del Modelo  
+  
+```{r}
+# teens_adi_pron_model <- teens_adi_train %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE))
+# 
+# teens_adi_pron_model |>
+#   pivot_longer(everything(),
+#                names_to = "Model name",
+#                values_to = "Orders")
+
+teens_adi_pron_model <- teens_adi_train %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_211_drift_auto = ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE),
+    arima_010 = ARIMA(TOTAL ~ pdq(0,1,0)),
+    arima_110 = ARIMA(TOTAL ~ pdq(1,1,0)),
+    arima_011 = ARIMA(TOTAL ~ pdq(0,1,1)),
+    arima_111 = ARIMA(TOTAL ~ pdq(1,1,1)),
+    arima_210 = ARIMA(TOTAL ~ pdq(2,1,0)),
+    arima_012 = ARIMA(TOTAL ~ pdq(0,1,2)),
+    arima_211 = ARIMA(TOTAL ~ pdq(2,1,1)),
+    
+    arima_010_100_4 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 4)),
+    arima_110_100_4 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 4)),
+    arima_011_100_4 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 4)),
+    arima_111_100_4 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 4)),
+    arima_210_100_4 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,0, period = 4)),
+    arima_012_100_4 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(1,0,0, period = 4)),
+    arima_211_100_4 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,0, period = 4)),
+    
+    arima_010_100_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 12)),
+    arima_110_100_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 12)),
+    arima_011_100_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 12)),
+    arima_111_100_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 12)),
+    arima_210_100_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,0, period = 12)),
+    arima_012_100_12 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(1,0,0, period = 12)),
+    arima_211_100_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,0, period = 12))
+  )
+
+teens_adi_pron_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(teens_adi_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(adi_teens_pron_arima_table <- glance(teens_adi_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ))
+
+adi_teens_arima_pron_gt <- adi_teens_pron_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+adi_teens_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.6.Adiccion_teens_arima_pron.rtf"))
+adi_teens_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.6.Adiccion_teens_arima_pron.tex"))
+
+
+teens_adi_final_arima_model <- teens_adi_pron_model |>
+  select(arima_011) 
+
+#arima_211 no es significativo
+#arima_211 y arima_211_drift son el mismo modelo
+
+teens_adi_final_arima_model |>
+  report()
+
+adi_teens_arima_gt <- teens_adi_final_arima_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "constant" ~ "Constante",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+adi_teens_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.7.Adiccion_teens_arima_pron_mod.rtf"))
+adi_teens_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.7.Adiccion_teens_arima_pron_mod.tex"))
+
+png(filename = file.path(img_folder, "4.6.Adicion_teens_pron_resids.png"),
+    width = 720, height = 480, units = "px")
+teens_adi_final_arima_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+
+teens_adi_final_arima_model |> 
+  gg_tsresiduals(lag=timeperiod)
+```
+  
+##### Verificación de supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(teens_adi_lb <-  augment(teens_adi_pron_model) |>
+  filter(.model == "arima_011") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 1))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+   
+###### Raíces Unitarias
+   
+```{r}
+teens_adi_final_arima_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "4.6.Adiccion_teens_pron_roots.png"),
+    width = 720, height = 480, units = "px")
+teens_adi_final_arima_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+   
+###### Normalidad de los residuos   
+   
+```{r}
+# Normalidad de Residuos - ARIMA
+teens_adi_residuals <- residuals(teens_adi_final_arima_model, type = "innovation") %>% as_tibble() %>% pull(.resid)
+
+mean(teens_adi_residuals)
+
+(teens_adi_jb_arima <- tseries::jarque.bera.test(teens_adi_residuals))
+
+(teens_adi_shap_arima <- shapiro.test(teens_adi_residuals))
+
+car::qqPlot(teens_adi_residuals)
+```
+   
+##### Agrupación de Resultados   
+   
+```{r}
+teens_adi_pron <- gen_pronostic_plot2(teens_adi_train, 
+                                      teens_adi_test,
+                                      teens_adi_final_arima_model,
+                                      h_forecast = 34)
+
+teens_adi_pron$pron_df <- teens_adi_pron$pron_df %>% 
+  mutate(
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(teens_adi_pron$pron_df$out)
+teens_adi_pron$pron_df$ds[teens_adi_pron$pron_df$out == 1]
+
+teens_adi_arima_sel_df <- forecast::accuracy(teens_adi_pron$pron_df$yhat,
+                                                    teens_adi_pron$pron_df$y) %>%
+  as_tibble() %>% 
+  mutate(Modelo = "ARIMA (0,1,1)",
+         Metric_Type = "Test set")
+
+summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Adicción por Drogas de Abuso",
+    Población = "12 a 19 años",
+    Enfoque = "Pronóstico",
+    Modelo = "ARIMA (0,1,1)",
+    # ACF_Residuales = "Solo 1/63 por fuera",
+    # Histograma = "Sesgado a la izquierda",
+    Residuals_LJung_Box_Test_ARIMA = round(teens_adi_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(teens_adi_jb_arima$p.value, 2)
+    # Residuals_Shapiro_Test_ARIMA = round(teens_adi_shap_arima$p.value, 2)
+  ))
+```
+  
+#### Prophet - Enfoque Pronóstico
+  
+```{r}
+# teens_adi_prophet_mod <- generate_prophet_forecast(teens_adi_train,
+#                                               teens_adi_test,
+#                                               periods = 34)
+# write_rds(teens_adi_prophet_mod, "modelos/teens_adi_prophet.RDS")
+teens_adi_prophet <- readRDS("modelos/teens_adi_prophet.RDS")
+
+teens_adi_prophet$acc_consolidated %>%
+  mutate(model = 1:nrow(teens_adi_prophet$acc_consolidated)) %>% 
+  arrange(RMSE, MAPE)
+
+teens_adi_sel_prophet <- 6
+teens_adi_prophet_plot <- generate_prophet_plot(teens_adi$ts_train, 
+                      teens_adi$ts_test, 
+                      forecast_tb = teens_adi_prophet$forecast_tb_list[[teens_adi_sel_prophet]])
+
+(adi_teens_both_metrics <- combine_model_metrics(teens_adi_arima_sel_df, 
+                      teens_adi_prophet$acc_consolidated[teens_adi_sel_prophet,]) %>% 
+    mutate_if(is.numeric, ~round(., 2)) %>% 
+    select(Modelo, RMSE, MAPE, MAE) %>% 
+  arrange(RMSE, MAPE))
+
+adi_teens_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "4.8.Adiccion_teens_proph_arima.rtf"))
+adi_teens_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "4.8.Adiccion_teens_proph_arima.tex"))
+```  
+  
+#### Gráficos de pronóstico
+  
+```{r}
+cowplot::plot_grid(teens_adi_pron$arima_plot, 
+                  teens_adi_prophet_plot, 
+                  labels = c('Arima', 'Prophet'))
+
+library(cowplot)
+teens_adi_plots_aligned  <- align_plots(teens_adi_pron$arima_plot + theme(legend.position = "none")  + ggtitle('ARIMA (0,1,1)'), 
+                     teens_adi_prophet_plot + theme(legend.position = "none")  + ggtitle('Prophet'),
+                     align = 'v', 
+                     axis = 'l')
+
+teens_adi_legend <- get_legend(teens_adi_pron$arima_plot)
+
+(teens_adi_final_plot <- cowplot::plot_grid(teens_adi_plots_aligned[[1]], 
+                   teens_adi_plots_aligned[[2]], 
+                  teens_adi_legend, 
+                  label_size = 10,
+                  rel_heights =  c(1, 1, .1),
+                  nrow = 3))
+
+png(filename = file.path(img_folder, "4.9.Adiccion_teens_pron_final.png"),
+    width = 720, height = 520, units = "px")
+teens_adi_final_plot
+dev.off()
+```  
+  
+## Drogas de Abuso - Mayores a 20 años
+
+```{r}
+adult_adi <- get_ts_from_agg_df(agg_intox_adi4, 
+                                 filtro_etario = "Mayor a 20 años")
+
+(adi_adult_prop <- sum(adult_adi$ts_full)/nrow(intox_adi))
+
+adult_adi_tsibble <- adult_adi$agg_data %>% 
+  as_tsibble(index = TIEMPO) %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO))
+
+adult_adi_train <- adult_adi_tsibble %>% 
+  filter(TIEMPO < tsibble::yearmonth("2020-03"))
+adult_adi_test <- adult_adi_tsibble %>% 
+  filter(TIEMPO >= tsibble::yearmonth("2020-03"))
+```
+
+### Changepoint - Mayores a 20 años
+
+```{r}
+adult_adi_cpts <- get_change_points(adult_adi$ts_full)
+adult_adi_cpts$cp_plot
+```  
+  
+### ARIMA - Enfoque Intervencion  
+  
+#### Estacionariedad y Autocorrelogramas Intervención   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+# DescTools::PlotACF(adult_adi$ts_full, main = "")
+
+adult_adi_tsibble %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+adult_adi_tsibble |>
+  features(TOTAL, unitroot_nsdiffs)
+
+adult_adi_tsibble |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+adult_adi_tsibble |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+adult_adi_tsibble |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+adult_adi_tsibble |>
+  gg_tsdisplay(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+adult_adi_tsibble |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  labs(title = "Diferenciado", y="")
+
+png(filename = file.path(img_folder, "4.10.Adiccion_may20_dif.png"),
+    width = 720, height = 480, units = "px")
+adult_adi_tsibble |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  ylab("Total Diferenciado (1)")
+dev.off()
+```  
+  
+#### Modelaje Intervención  
+  
+##### Selección del Modelo  
+  
+```{r}
+inter <- c(rep(0, 62), rep(1, 34))
+timeperiod <- 96
+
+# adult_adi_inter_model <- adult_adi_tsibble %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE))
+
+adult_adi_inter_model <- adult_adi_tsibble %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_012_200_12_auto = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(2,0,0, period = 12) + inter),
+    arima_010 = ARIMA(TOTAL ~ pdq(0,1,0) + inter),
+    arima_110 = ARIMA(TOTAL ~ pdq(1,1,0) + inter),
+    arima_011 = ARIMA(TOTAL ~ pdq(0,1,1) + inter),
+    arima_111 = ARIMA(TOTAL ~ pdq(1,1,1) + inter),
+    arima_210 = ARIMA(TOTAL ~ pdq(2,1,0) + inter),
+    arima_211 = ARIMA(TOTAL ~ pdq(2,1,1) + inter),
+    arima_012 = ARIMA(TOTAL ~ pdq(0,1,2) + inter),
+    arima_112 = ARIMA(TOTAL ~ pdq(1,1,2) + inter),
+    arima_310 = ARIMA(TOTAL ~ pdq(3,1,0) + inter),
+    arima_311 = ARIMA(TOTAL ~ pdq(3,1,1) + inter),
+    arima_312 = ARIMA(TOTAL ~ pdq(3,1,2) + inter),
+    
+    arima_010_100_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_110_100_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_011_100_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_111_100_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_210_100_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_211_100_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_012_100_12 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(1,0,0, period = 12) + inter),
+    arima_112_100_12 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(1,0,0, period = 12) + inter),
+    arima_310_100_12 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_311_100_12 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_312_100_12 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(1,0,0, period = 12) + inter),
+    
+    arima_010_002_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,2, period = 6) + inter),
+    arima_110_002_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,2, period = 6) + inter),
+    arima_011_002_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,2, period = 6) + inter),
+    arima_111_002_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,2, period = 6) + inter),
+    arima_210_002_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,2, period = 6) + inter),
+    arima_211_002_6 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,2, period = 6) + inter),
+    arima_012_002_6 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(0,0,2, period = 6) + inter),
+    arima_112_002_6 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(0,0,2, period = 6) + inter),
+    arima_310_002_6 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,2, period = 6) + inter),
+    arima_311_002_6 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,2, period = 6) + inter),
+    arima_312_002_6 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(0,0,2, period = 6) + inter),
+    
+    arima_010_001_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_110_001_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_011_001_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,1, period = 6) + inter),
+    arima_111_001_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,1, period = 6) + inter),
+    arima_210_001_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_211_001_6 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,1, period = 6) + inter),
+    arima_012_001_6 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(0,0,1, period = 6) + inter),
+    arima_112_001_6 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(0,0,1, period = 6) + inter),
+    arima_310_001_6 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_311_001_6 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,1, period = 6) + inter),
+    arima_312_001_6 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(0,0,1, period = 6) + inter),
+    
+    arima_010_002_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,2, period = 12) + inter),
+    arima_110_002_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,2, period = 12) + inter),
+    arima_011_002_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,2, period = 12) + inter),
+    arima_111_002_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,2, period = 12) + inter),
+    arima_210_002_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,2, period = 12) + inter),
+    arima_211_002_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,2, period = 12) + inter),
+    arima_012_002_12 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(0,0,2, period = 12) + inter),
+    arima_112_002_12 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(0,0,2, period = 12) + inter),
+    arima_310_002_12 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,2, period = 12) + inter),
+    arima_311_002_12 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,2, period = 12) + inter),
+    arima_312_002_12 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(0,0,2, period = 12) + inter),
+    
+    arima_010_001_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_110_001_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_011_001_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,1, period = 12) + inter),
+    arima_111_001_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,1, period = 12) + inter),
+    arima_210_001_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_211_001_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,1, period = 12) + inter),
+    arima_012_001_12 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(0,0,1, period = 12) + inter),
+    arima_112_001_12 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(0,0,1, period = 12) + inter),
+    arima_310_001_12 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_311_001_12 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,1, period = 12) + inter),
+    arima_312_001_12 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(0,0,1, period = 12) + inter),
+    
+    arima_010_101_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,1, period = 6) + inter),
+    arima_110_101_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,1, period = 6) + inter),
+    arima_011_101_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,1, period = 6) + inter),
+    arima_111_101_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,1, period = 6) + inter),
+    arima_210_101_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,1, period = 6) + inter),
+    arima_211_101_6 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,1, period = 6) + inter),
+    arima_012_101_6 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(1,0,1, period = 6) + inter),
+    arima_112_101_6 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(1,0,1, period = 6) + inter),
+    arima_310_101_6 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(1,0,1, period = 6) + inter),
+    arima_311_101_6 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(1,0,1, period = 6) + inter),
+    arima_312_101_6 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(1,0,1, period = 6) + inter),
+    
+    arima_010_102_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,2, period = 12) + inter),
+    arima_110_102_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,2, period = 12) + inter),
+    arima_011_102_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,2, period = 12) + inter),
+    arima_111_102_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,2, period = 12) + inter),
+    arima_210_102_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,2, period = 12) + inter),
+    arima_211_102_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,2, period = 12) + inter),
+    arima_012_102_12 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(1,0,2, period = 12) + inter),
+    arima_112_102_12 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(1,0,2, period = 12) + inter),
+    arima_310_102_12 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(1,0,2, period = 12) + inter),
+    arima_311_102_12 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(1,0,2, period = 12) + inter),
+    arima_312_102_12 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(1,0,2, period = 12) + inter),
+    
+    arima_010_101_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,1, period = 12) + inter),
+    arima_110_101_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,1, period = 12) + inter),
+    arima_011_101_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,1, period = 12) + inter),
+    arima_111_101_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,1, period = 12) + inter),
+    arima_210_101_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,1, period = 12) + inter),
+    arima_211_101_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,1, period = 12) + inter),
+    arima_012_101_12 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(1,0,1, period = 12) + inter),
+    arima_112_101_12 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(1,0,1, period = 12) + inter),
+    arima_310_101_12 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(1,0,1, period = 12) + inter),
+    arima_311_101_12 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(1,0,1, period = 12) + inter),
+    arima_312_101_12 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(1,0,1, period = 12) + inter),
+    
+    arima_010_102_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,2, period = 6) + inter),
+    arima_110_102_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,2, period = 6) + inter),
+    arima_011_102_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,2, period = 6) + inter),
+    arima_111_102_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,2, period = 6) + inter),
+    arima_210_102_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,2, period = 6) + inter),
+    arima_211_102_6 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,2, period = 6) + inter),
+    arima_012_102_6 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(1,0,2, period = 6) + inter),
+    arima_112_102_6 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(1,0,2, period = 6) + inter),
+    arima_310_102_6 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(1,0,2, period = 6) + inter),
+    arima_311_102_6 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(1,0,2, period = 6) + inter),
+    arima_312_102_6 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(1,0,2, period = 6) + inter)
+  )
+
+adult_adi_inter_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(adult_adi_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(adult_adi_arima_table <- glance(adult_adi_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_remove(Modelo, "_auto"),
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ))
+
+adult_adi_arima_int_gt <- adult_adi_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+adult_adi_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.9.Adult_adi_arima_int.rtf"))
+adult_adi_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.9.Adult_adi_arima_int.tex"))
+
+adult_adi_inter_sel_model <- adult_adi_inter_model |>
+  select(arima_012_200_12_auto)
+
+adult_adi_inter_sel_model |>
+  report()
+
+adult_adi_arima_gt <- adult_adi_inter_sel_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "inter" ~ "Intervención",
+      term == "intercept" ~ "Intercepto",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+adult_adi_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.10.Adult_adi_arima_int_mod.rtf"))
+adult_adi_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.10.Adult_adi_arima_int_mod.tex"))
+
+png(filename = file.path(img_folder, "4.11.Adult_adi_int_resids.png"),
+    width = 720, height = 480, units = "px")
+adult_adi_inter_sel_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+
+adult_adi_inter_sel_model |> 
+  gg_tsresiduals(lag=timeperiod)
+```
+  
+##### Verificación de Supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(adult_adi_inter_lb <- augment(adult_adi_inter_model) |>
+  filter(.model == "arima_012_200_12_auto") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 4))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+  
+###### Raíces Unitarias  
+  
+```{r}
+adult_adi_inter_sel_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "4.10.Adult_adi_int_roots.png"),
+    width = 720, height = 480, units = "px")
+adult_adi_inter_sel_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+  
+###### Normalidad de los residuos  
+  
+```{r}
+# Normalidad de Residuos - ARIMA
+adult_adi_inter_ts_residuals <- residuals(adult_adi_inter_sel_model, 
+                                    type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(adult_adi_inter_ts_residuals)
+
+(adult_adi_inter_jb_arima <- tseries::jarque.bera.test(adult_adi_inter_ts_residuals))
+
+(adult_adi_inter_shap_arima <-shapiro.test(adult_adi_inter_ts_residuals))
+
+car::qqPlot(adult_adi_inter_ts_residuals)
+
+# Normalidad de residuos - Regresion
+adult_adi_inter_reg_residuals <- residuals(adult_adi_inter_sel_model, type = "regression") %>% as_tibble() %>% pull(.resid)
+
+mean(adult_adi_inter_reg_residuals)
+
+(adult_adi_inter_shap_reg <- shapiro.test(adult_adi_inter_reg_residuals))
+
+car::qqPlot(adult_adi_inter_reg_residuals)
+
+# Visualizacion ambos graficos
+bind_rows(
+    `Regression residuals` =
+        as_tibble(residuals(adult_adi_inter_sel_model, type = "regression")),
+    `ARIMA residuals` =
+        as_tibble(residuals(adult_adi_inter_sel_model, type = "innovation")),
+    .id = "type"
+  ) |>
+  mutate(
+    TIEMPO = as_date(TIEMPO)
+  ) |>
+  ggplot(aes(x = TIEMPO, y = .resid)) +
+  geom_line() +
+  facet_grid(vars(type))
+```
+  
+##### Agrupación de resultados  
+  
+```{r}
+(summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Adicción por drogas de abuso",
+    Población = "Mayores de 20 años",
+    Enfoque = "Intervención",
+    Modelo = "Regresion con ARIMA (0,1,2)(2,0,0)[12]",
+    # Significancia_intervencion = "No",
+    # ACF_Residuales = "1 de 96 fuera",
+    # Histograma = "Sesgado a la derecha",
+    Residuals_LJung_Box_Test_ARIMA = round(adult_adi_inter_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(adult_adi_inter_jb_arima$p.value, 2),
+    # Residuals_Shapiro_Test_ARIMA = round(adult_adi_inter_shap_arima$p.value, 2),
+    Residuals_Shapiro_Wilk_Regression = round(adult_adi_inter_shap_reg$p.value, 2)
+  )))
+```
+  
+#### ARIMA - Enfoque Pronostico  
+  
+#### Estacionariedad y Autocorrelogramas Pronóstico   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+adult_adi_train %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+adult_adi_train |>
+  features(TOTAL, unitroot_nsdiffs)
+
+adult_adi_train |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+adult_adi_train |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+adult_adi_train |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+adult_adi_train |>
+  gg_tsdisplay(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+png(filename = file.path(img_folder, "4.12.Adult_adi_pron_dif.png"),
+    width = 720, height = 480, units = "px")
+adult_adi_train |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  ylab("Total Diferenciado (11)")
+dev.off()
+```    
+  
+#### Modelaje Pronóstico     
+  
+##### Selección del Modelo  
+  
+```{r}
+# adult_adi_pron_model <- adult_adi_train %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE))
+# 
+# adult_adi_pron_model |>
+#   pivot_longer(everything(),
+#                names_to = "Model name",
+#                values_to = "Orders")
+
+adult_adi_pron_model <- adult_adi_train %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_112_100_12_auto = ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE),
+    arima_010 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,0)),
+    arima_110 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,0)),
+    arima_011 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,0)),
+    arima_111 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,0)),
+    arima_210 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,0)),
+    arima_211 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,0)),
+    arima_012 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(0,0,0)),
+    arima_112 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(0,0,0)),
+    arima_310 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,0)),
+    arima_311 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,0)),
+    arima_312 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(0,0,0)),
+    
+    arima_010_100_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 12)),
+    arima_110_100_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 12)),
+    arima_011_100_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 12)),
+    arima_111_100_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 12)),
+    arima_210_100_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,0, period = 12)),
+    arima_211_100_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,0, period = 12)),
+    arima_012_100_12 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(1,0,0, period = 12)),
+    arima_112_100_12 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(1,0,0, period = 12)),
+    arima_310_100_12 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(1,0,0, period = 12)),
+    arima_311_100_12 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(1,0,0, period = 12)),
+    arima_312_100_12 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(1,0,0, period = 12)),
+    
+    arima_010_002_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,2, period = 6)),
+    arima_110_002_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,2, period = 6)),
+    arima_011_002_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,2, period = 6)),
+    arima_111_002_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,2, period = 6)),
+    arima_210_002_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,2, period = 6)),
+    arima_211_002_6 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,2, period = 6)),
+    arima_012_002_6 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(0,0,2, period = 6)),
+    arima_112_002_6 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(0,0,2, period = 6)),
+    arima_310_002_6 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,2, period = 6)),
+    arima_311_002_6 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,2, period = 6)),
+    arima_312_002_6 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(0,0,2, period = 6)),
+    
+    arima_010_001_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,1, period = 6)),
+    arima_110_001_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,1, period = 6)),
+    arima_011_001_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,1, period = 6)),
+    arima_111_001_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,1, period = 6)),
+    arima_210_001_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,1, period = 6)),
+    arima_211_001_6 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,1, period = 6)),
+    arima_012_001_6 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(0,0,1, period = 6)),
+    arima_112_001_6 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(0,0,1, period = 6)),
+    arima_310_001_6 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,1, period = 6)),
+    arima_311_001_6 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,1, period = 6)),
+    arima_312_001_6 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(0,0,1, period = 6)),
+    
+    arima_010_002_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,2, period = 12)),
+    arima_110_002_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,2, period = 12)),
+    arima_011_002_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,2, period = 12)),
+    arima_111_002_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,2, period = 12)),
+    arima_210_002_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,2, period = 12)),
+    arima_211_002_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,2, period = 12)),
+    arima_012_002_12 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(0,0,2, period = 12)),
+    arima_112_002_12 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(0,0,2, period = 12)),
+    arima_310_002_12 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,2, period = 12)),
+    arima_311_002_12 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,2, period = 12)),
+    arima_312_002_12 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(0,0,2, period = 12)),
+    
+    arima_010_001_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,1, period = 12)),
+    arima_110_001_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,1, period = 12)),
+    arima_011_001_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,1, period = 12)),
+    arima_111_001_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,1, period = 12)),
+    arima_210_001_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,1, period = 12)),
+    arima_211_001_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,1, period = 12)),
+    arima_012_001_12 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(0,0,1, period = 12)),
+    arima_112_001_12 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(0,0,1, period = 12)),
+    arima_310_001_12 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,1, period = 12)),
+    arima_311_001_12 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,1, period = 12)),
+    arima_312_001_12 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(0,0,1, period = 12)),
+    
+    arima_010_101_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,1, period = 6)),
+    arima_110_101_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,1, period = 6)),
+    arima_011_101_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,1, period = 6)),
+    arima_111_101_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,1, period = 6)),
+    arima_210_101_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,1, period = 6)),
+    arima_211_101_6 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,1, period = 6)),
+    arima_012_101_6 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(1,0,1, period = 6)),
+    arima_112_101_6 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(1,0,1, period = 6)),
+    arima_310_101_6 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(1,0,1, period = 6)),
+    arima_311_101_6 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(1,0,1, period = 6)),
+    arima_312_101_6 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(1,0,1, period = 6)),
+    
+    arima_010_102_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,2, period = 12)),
+    arima_110_102_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,2, period = 12)),
+    arima_011_102_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,2, period = 12)),
+    arima_111_102_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,2, period = 12)),
+    arima_210_102_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,2, period = 12)),
+    arima_211_102_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,2, period = 12)),
+    arima_012_102_12 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(1,0,2, period = 12)),
+    arima_112_102_12 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(1,0,2, period = 12)),
+    arima_310_102_12 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(1,0,2, period = 12)),
+    arima_311_102_12 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(1,0,2, period = 12)),
+    arima_312_102_12 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(1,0,2, period = 12)),
+    
+    arima_010_101_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,1, period = 12)),
+    arima_110_101_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,1, period = 12)),
+    arima_011_101_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,1, period = 12)),
+    arima_111_101_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,1, period = 12)),
+    arima_210_101_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,1, period = 12)),
+    arima_211_101_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,1, period = 12)),
+    arima_012_101_12 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(1,0,1, period = 12)),
+    arima_112_101_12 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(1,0,1, period = 12)),
+    arima_310_101_12 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(1,0,1, period = 12)),
+    arima_311_101_12 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(1,0,1, period = 12)),
+    arima_312_101_12 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(1,0,1, period = 12)),
+    
+    arima_010_102_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,2, period = 6)),
+    arima_110_102_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,2, period = 6)),
+    arima_011_102_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,2, period = 6)),
+    arima_111_102_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,2, period = 6)),
+    arima_210_102_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,2, period = 6)),
+    arima_211_102_6 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,2, period = 6)),
+    arima_012_102_6 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(1,0,2, period = 6)),
+    arima_112_102_6 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(1,0,2, period = 6)),
+    arima_310_102_6 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(1,0,2, period = 6)),
+    arima_311_102_6 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(1,0,2, period = 6)),
+    arima_312_102_6 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(1,0,2, period = 6))
+  )
+
+adult_adi_pron_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(adult_adi_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(adult_adi_pron_arima_table <- glance(adult_adi_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_remove(Modelo, "_auto"),
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ))
+
+adult_adi_arima_pron_gt <- adult_adi_pron_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+adult_adi_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.11.Adult_adi_arima_pron.rtf"))
+adult_adi_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.11.Adult_adi_arima_pron.tex"))
+
+adult_adi_final_arima_model <- adult_adi_pron_model |>
+  select(arima_112_100_12_auto) 
+
+adult_adi_final_arima_model |>
+  report()
+
+adult_adi_arima_gt <- adult_adi_final_arima_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "constant" ~ "Constante",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+adult_adi_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.12.Adi_adultos_arima_pron_mod.rtf"))
+adult_adi_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "4.12.Adi_adultos_arima_pron_mod.tex"))
+
+png(filename = file.path(img_folder, "4.14.Adi_adultos_pron_resids.png"),
+    width = 720, height = 480, units = "px")
+adult_adi_final_arima_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+
+adult_adi_final_arima_model |> 
+  gg_tsresiduals(lag=timeperiod)
+```
+  
+##### Verificación de supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(adult_adi_lb <-  augment(adult_adi_pron_model) |>
+  filter(.model == "arima_112_100_12_auto") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 4))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+   
+###### Raíces Unitarias
+   
+```{r}
+adult_adi_final_arima_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "4.13.Adult_adi_pron_roots.png"),
+    width = 720, height = 480, units = "px")
+adult_adi_final_arima_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+   
+###### Normalidad de los residuos   
+   
+```{r}
+# Normalidad de Residuos - ARIMA
+adult_adi_residuals <- residuals(adult_adi_final_arima_model, type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(adult_adi_residuals)
+
+(adult_adi_jb_arima <- tseries::jarque.bera.test(adult_adi_residuals))
+
+(adult_adi_shap_arima <- shapiro.test(adult_adi_residuals))
+
+car::qqPlot(adult_adi_residuals)
+```
+   
+##### Agrupación de Resultados   
+   
+```{r}
+adult_adi_pron <- gen_pronostic_plot2(adult_adi_train, 
+                                      adult_adi_test,
+                                      adult_adi_final_arima_model,
+                                      h_forecast = 34)
+
+adult_adi_pron$pron_df <- adult_adi_pron$pron_df %>% 
+  mutate(
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(adult_adi_pron$pron_df$out)
+adult_adi_pron$pron_df$ds[adult_adi_pron$pron_df$out == 1]
+
+adult_adi_arima_sel_df <- forecast::accuracy(adult_adi_pron$pron_df$yhat,
+                                                    adult_adi_pron$pron_df$y) %>%
+  as_tibble() %>% 
+  mutate(Modelo = "ARIMA (1,1,2)(1,0,0)[12]",
+         Metric_Type = "Test set")
+
+summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Adicción por drogas de abuso",
+    Población = "Mayores de 20 años",
+    Enfoque = "Pronóstico",
+    Modelo = "ARIMA (1,1,2)(1,0,0)[12]",
+    # ACF_Residuales = "Todos dentro",
+    # Histograma = "Sesgado a la derecha con 2 valores extremos",
+    Residuals_LJung_Box_Test_ARIMA = round(adult_adi_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(adult_adi_jb_arima$p.value, 2),
+    # Residuals_Shapiro_Test_ARIMA = round(adult_adi_shap_arima$p.value, 2)
+  ))
+```
+  
+#### Prophet - Enfoque Pronóstico
+  
+```{r}
+# adult_adi_prophet_mod <- generate_prophet_forecast(adult_adi_train,
+#                                               adult_adi_test,
+#                                               periods = 34)
+# write_rds(adult_adi_prophet_mod, "modelos/adult_adi_prophet.RDS")
+adult_adi_prophet <- readRDS("modelos/adult_adi_prophet.RDS")
+
+adult_adi_prophet$acc_consolidated %>%
+  mutate(model = 1:nrow(adult_adi_prophet$acc_consolidated)) %>% 
+  arrange(RMSE, MAPE)
+
+adult_adi_sel_prophet <- 36
+
+adult_adi_forecast_tb <- adult_adi_prophet$forecast_tb_list[[adult_adi_sel_prophet]] %>% 
+  mutate(
+    y = adult_adi_pron$pron_df$y,
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(adult_adi_forecast_tb$out)
+adult_adi_forecast_tb$ds[adult_adi_forecast_tb$out == 1]
+
+adult_adi_prophet_plot <- generate_prophet_plot(adult_adi$ts_train, 
+                      adult_adi$ts_test, 
+                      forecast_tb = adult_adi_prophet$forecast_tb_list[[adult_adi_sel_prophet]])
+
+(adult_adi_both_metrics <- combine_model_metrics(adult_adi_arima_sel_df, 
+                      adult_adi_prophet$acc_consolidated[adult_adi_sel_prophet,]) %>% 
+    mutate_if(is.numeric, ~round(., 2)) %>% 
+    select(Modelo, RMSE, MAPE) %>% 
+  arrange(RMSE, MAPE))
+
+
+adult_adi_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "4.13.Adult_adi_proph_arima.rtf"))
+adult_adi_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "4.13.Adult_adi_proph_arima.tex"))
+```  
+  
+#### Gráficos de pronóstico
+  
+```{r}
+cowplot::plot_grid(adult_adi_pron$arima_plot, 
+                  adult_adi_prophet_plot, 
+                  labels = c('Arima', 'Prophet'))
+
+library(cowplot)
+adult_adi_plots_aligned  <- align_plots(adult_adi_pron$arima_plot + theme(legend.position = "none")  + ggtitle('ARIMA (1,1,2)(1,0,0)[12]'), 
+                     adult_adi_prophet_plot + theme(legend.position = "none")  + ggtitle('Prophet'),
+                     align = 'v', 
+                     axis = 'l')
+
+adult_adi_arima_legend <- get_legend(adult_adi_pron$arima_plot)
+
+(adult_adi_final_plot <- cowplot::plot_grid(adult_adi_plots_aligned[[1]], 
+                   adult_adi_plots_aligned[[2]], 
+                  adult_adi_arima_legend, 
+                  label_size = 10,
+                  rel_heights =  c(1, 1, .1),
+                  nrow = 3))
+
+png(filename = file.path(img_folder, "4.15.Adult_adi_pron_final.png"),
+    width = 720, height = 520, units = "px")
+adult_adi_final_plot
+dev.off()
+```  
+    
+```{r}
+summary_arima_mods %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "4.14.Adult_adi_proph_arima.rtf"))
+summary_arima_mods %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "4.14.Adult_adi_proph_arima.tex"))
+```  

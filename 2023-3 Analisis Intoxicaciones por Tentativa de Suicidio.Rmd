@@ -1,0 +1,2085 @@
+---
+title: "Análisis de Intoxicaciones Reportadas por Tentativa de Suicidio"
+author: "Edgardo Gutiérrez Vega"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    downcute_theme: "chaos"
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 99)
+read_folder <- "datos_procesados"
+save_graficos <- "resultados_graficos"
+causa_ref <- "Tentativa de suicidio"
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(gtsummary)
+library(sf)
+library(FactoMineR)
+library(factoextra)
+source("R/tibl_to_ts.R")
+source("R/ggplot_ts.R")
+source("R/plot_map.R")
+source("R/get_ts_from_agg_df.R")
+source("R/get_arima_model.R")
+source("R/get_change_points.R")
+source("R/generate_counts.R")
+source("R/generate_counts_v2.R")
+source("R/generate_dtw_cluster_plot.R")
+source("R/analisis_correspondencia.R")
+source("R/get_cumulative_frequencies.R")
+source("R/generate_prophet_forecast.R")
+source("R/gg_arma_spanish.R")
+source("R/gg_tsresiduals_spanish.R")
+source("R/gg_tsdisplay_spanish.R")
+library(fable)
+library(feasts)
+img_folder <- "0.documento_final/img_finales/3.Suicidio"
+tab_folder <- "0.documento_final/tab_finales/3.Suicidio"
+intox_sui <- read_rds(file.path(read_folder, "intox_suicidio.RDS"))
+pob_year_sexo_ge_canton <- read_rds(file.path(read_folder, "pob_data.RDS"))
+meds <- read_rds(file.path(read_folder, "meds.RDS"))
+cantones_st <- read_rds(file.path(read_folder, "cantones_st.RDS"))
+table_count <- 1
+summary_arima_mods <- tibble()
+```
+
+## Análisis Intoxicaciones Tentativa de suicidio
+  
+### Procesamiento de datos de tentativa de suicidio  
+  
+En el caso de las intoxicaciones por tentativas de suicidio, el Cuadro  `r table_count` muestra que los grupos principales de interés con los que se reporta este tipo de intoxicaciones son los Sedantes/hipnoticos, ansioliticos, los plaguicidas, Antidepresivos y psicoestimulantes, Medicamentos para el dolor, Anticonvulsivos, y Antihistaminicos, antiemeticos, antipruriticos, todos con un total superior a 1 mil casos en el período de 2015 a 2022, para un total aproximado de 74% de los casos reportados como causa por tentativa de suicidio. 
+  
+```{r}
+intox_sui$TOXICO_INTERES1 %>% table %>% prop.table() %>% sort
+
+intox_sui_freq_table <- get_cumulative_frequencies(intox_sui, "TOXICO_INTERES1")
+
+table_count <- table_count + 1
+
+(sui_freq <- intox_sui_freq_table %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  mutate(TOX_FREQ = paste0(TOX_FREQ, "%"),
+         TOX_FREQ_CUMSUM = paste0(TOX_FREQ_CUMSUM, "%")) %>% 
+  rename(
+    `Tipo de Tóxico Principal` = TOXICO_INTERES1,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+sui_freq %>% 
+  gt::gtsave(file.path(tab_folder, "3.1.tentativa.rtf"))
+sui_freq %>% 
+  gt::gtsave(file.path(tab_folder, "3.1.tentativa.tex"))
+```
+  
+Al visualizar más en detalle la categoría "Otros" en los tóxicos de interés, hay múltiples tóxicos de interés con la metformina alcanzando un 10% del tamaño del grupo.
+
+```{r}
+otros_sui_df <- intox_sui %>% 
+  filter(TOXICO_INTERES1 == "Otros")
+
+intox_sui_otros_table <- get_cumulative_frequencies(otros_sui_df, "TOXICO1")
+
+table_count <- table_count + 1
+
+intox_sui_otros_table %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+```   
+  
+Al visualizarlos a nivel de código de tóxico, el 92% de los casos son medicamentos, por lo que se incluirá este nivel dentro de los tóxicos de interés.  
+
+```{r}
+intox_sui_otros_codtox <- get_cumulative_frequencies(otros_sui_df, "CODTOX1")
+
+table_count <- table_count + 1
+
+intox_sui_otros_codtox %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+```      
+  
+Al realizar este cambio, la categoria "Otros medicamentos"se convierte en el principal grupo de interés, seguido por los medicamentos para el dolor. Por la naturaleza de la causa, Se excluyeron los tóxicos de interés que no son medicamentos quedando un 98% de los datos para el análisis.  
+
+```{r}
+intox_sui <- intox_sui %>% 
+  mutate(
+    TOXICO_INTERES1_BACKUP = TOXICO_INTERES1,
+    TOXICO_INTERES1 = case_when(
+      CODTOX1 == "01.Medicamentos" & TOXICO_INTERES1 == "Otros" ~ "Otros Medicamentos",
+      TRUE ~ TOXICO_INTERES1
+    )
+  ) 
+
+intox_sui_freq_table <- get_cumulative_frequencies(intox_sui, "TOXICO_INTERES1")
+
+table_count <- table_count + 1
+
+intox_sui_freq_table %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+```  
+  
+La tendencia de las diferentes series de tiempo muestra tendencias de crecimiento marcadas aparentemente luego del 2020 para la mayoría de medicamentos, sin embargo, los conteos son bajos, por lo que se decidió agrupar algunos de estos grupos siguiendo las indicaciones de la asesora del CNCI.  
+  
+```{r fig.width=10, fig.height=15}
+agg_intox_sui_toxs <- generate_counts2(
+  intox_sui, 
+  date_column = "TIEMPO",
+  grouping_variables = c("TOXICO_INTERES1"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_sui_toxs_std <- generate_counts2(
+  intox_sui, 
+  date_column = "TIEMPO",
+  grouping_variables = c("TOXICO_INTERES1"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+png(filename = file.path(img_folder, "3.1.tentativa_std.png"),
+    width = 920, height = 800, units = "px")
+generate_dtw_cluster_plot(agg_intox_sui_toxs_std, k_clusters = 4, lab_y = "Totales Estandarizados")
+dev.off()
+png(filename = file.path(img_folder, "3.2.tentativa.png"),
+    width = 920, height = 800, units = "px")
+generate_dtw_cluster_plot(agg_intox_sui_toxs, k_clusters = 4, lab_y = "Total de Casos Reportados")
+dev.off()
+```     
+  
+Tomando en cuenta la agrupación planteada, se observaron tres grupos principales que cubren el 94% de los casos y cuentan con más de 1 mil casos: medicamentos con acción a nivel de SNC que cubren un 46.5% de los casos, medicamentos varios que correspondieron a 33% de los casos y plaguicidas que tuvieron una equivalencia al 13.8% de los casos.  
+  
+```{r}
+intox_sui <- intox_sui %>% 
+  mutate(
+    TOXICO_INTERES1_BACKUP = TOXICO_INTERES1,
+    TOXICO_INTERES1 = case_when(
+      TOXICO_INTERES1 %in% c("Antidepresivos y psicoestimulantes", "Sedantes/hipnoticos, ansioliticos", "Antipsicoticos", "Anticonvulsivos", "Analgesicos Narcoticos") ~ "Medicamentos con acción a nivel del SNC",
+      CODTOX1 == "01.Medicamentos" ~ "Medicamentos Varios",
+      TRUE ~ TOXICO_INTERES1
+    )
+  ) 
+
+intox_sui_freq_table <- get_cumulative_frequencies(intox_sui, "TOXICO_INTERES1")
+
+table_count <- table_count + 1
+
+(intox_sui_freq2 <- intox_sui_freq_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  mutate(TOX_FREQ = paste0(TOX_FREQ, "%"),
+         TOX_FREQ_CUMSUM = paste0(TOX_FREQ_CUMSUM, "%")) %>% 
+  rename(
+    `Tipo de Tóxico Principal` = TOXICO_INTERES1,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+intox_sui_freq2 %>% 
+  gt::gtsave(file.path(tab_folder, "3.2.tentativa.rtf"))
+intox_sui_freq2 %>% 
+  gt::gtsave(file.path(tab_folder, "3.2.tentativa.tex"))
+```
+  
+En general todos los medicamentos mostraron un aumento, sin embargo, los medicamentos con acción en el SNC mostraron un incremento importante, que vale la pena explorar por separado.  
+  
+```{r fig.width=10, fig.height=15}
+agg_intox_sui_toxs <- generate_counts2(
+  intox_sui, 
+  date_column = "TIEMPO",
+  grouping_variables = c("TOXICO_INTERES1"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_sui_toxs_std <- generate_counts2(
+  intox_sui, 
+  date_column = "TIEMPO",
+  grouping_variables = c("TOXICO_INTERES1"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_sui_toxs, k_clusters = 4)
+generate_dtw_cluster_plot(agg_intox_sui_toxs_std, k_clusters = 4)
+
+png(filename = file.path(img_folder, "3.3.tentativa_std.png"),
+    width = 920, height = 800, units = "px")
+generate_dtw_cluster_plot(agg_intox_sui_toxs_std, k_clusters = 4, lab_y = "Totales Estandarizados")
+dev.off()
+png(filename = file.path(img_folder, "3.4.tentativa.png"),
+    width = 920, height = 800, units = "px")
+generate_dtw_cluster_plot(agg_intox_sui_toxs, k_clusters = 4, lab_y = "Total de Casos Reportados")
+dev.off()
+```       
+  
+El Cuadro `r table_count` presenta los conteos por año según sexo, grupo etario y tóxico de interés. Se observó que las mujeres tienen una tendencia superior a reportar intoxicaciones por esta causa, llegando casi al doble de los casos reportados por hombres durante el 2021 y 2022. El grupo etario con edades entre los 15 y 19 años consistió en el mayor grupo con reportes de tentativas de suicidio a lo largo de todos los años. Tomando en cuenta estas frecuencias, se procedió a generar grupos etarios más generales para las otras edades, y se filtraron casos menores a 12 años y mayores a 59 años.   
+  
+```{r}
+table_count <- table_count + 1
+
+intox_sui_fltd <- intox_sui_freq_table %>% 
+  right_join(intox_sui) %>%
+  filter(TOX_FREQ >= 20) 
+
+intox_sui_fltd <- intox_sui_fltd %>% 
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      GRUPO_ETARIO %in% c("20 a 24 años", "25 a 29 años") ~ "20 a 29 años",
+      GRUPO_ETARIO %in% c("30 a 34 años", "35 a 39 años") ~ "30 a 39 años",
+      GRUPO_ETARIO %in% c("40 a 44 años", "45 a 49 años") ~ "40 a 49 años",
+      GRUPO_ETARIO %in% c("50 a 54 años", "55 a 59 años") ~ "50 a 59 años",
+      TRUE ~ GRUPO_ETARIO
+    )
+  )
+
+(summ_tentativa <- intox_sui_fltd %>%
+  select(YEAR, SEXO, GRUPO_ETARIO2) %>% 
+       tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(GRUPO_ETARIO2 ~ "Grupo Etario",
+                     SEXO ~ "Sexo"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**") %>% 
+    as_gt())
+
+summ_tentativa %>% 
+  gt::gtsave(file.path(tab_folder, "3.3.tentativa.rtf"))
+summ_tentativa %>% 
+  gt::gtsave(file.path(tab_folder, "3.3.tentativa.tex"))
+```
+  
+El Cuadro `r table_count` presenta las proporciones actualizadas por año según los nuevos grupos etarios. Con este arreglo, los grupos principales son el de 20 a 29 años y el de 12 a 19 años.  
+  
+```{r}
+intox_sui_fltd <- intox_sui_fltd %>% 
+  filter(EDAD_A >= 12 & EDAD_A < 60) %>% 
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      EDAD_A >= 12 & EDAD_A < 20 ~ "12 a 19 años",
+      TRUE ~ GRUPO_ETARIO2
+    )
+  )
+
+table_count <- table_count + 1
+
+intox_sui_fltd %>%
+  select(YEAR, SEXO, GRUPO_ETARIO2, TOXICO_INTERES1, TOXICO1) %>% 
+       tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(TOXICO_INTERES1 ~ "Toxico de Interés"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**")
+```
+  
+El Cuadro `r table_count` presenta el detalle de los tóxicos específicos relacionados con los reportes de intoxicación por tentativa de suicidio, siendo clonazepam, acetaminofen y fluoxetina los principales tóxicos reportados con aproximadamente el 30% de los casos totales en todo el período analizado.  
+  
+```{r}
+table_count <- table_count + 1
+
+get_cumulative_frequencies(intox_sui_fltd, "TOXICO1") %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+
+
+(tentativa_sel_toxicos <- get_cumulative_frequencies(intox_sui_fltd, "TOXICO1") %>% 
+  mutate(
+    TOXICO1 = case_when(
+      TOX_FREQ < 2 ~ "Otros",
+      TRUE ~ TOXICO1
+    ),
+    TOXICO1 = str_to_title(TOXICO1)
+  ) %>% 
+  group_by(TOXICO1) %>% 
+  summarise(
+    TOX_N = sum(TOX_N),
+    TOX_FREQ = sum(TOX_FREQ)
+  ) %>%
+  arrange(desc(TOX_FREQ)) %>% 
+  arrange(TOXICO1 == "Otros") %>% 
+  mutate(TOX_FREQ_CUMSUM = cumsum(TOX_FREQ)) %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  rename(
+    `Tóxico Principal` = TOXICO1,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+tentativa_sel_toxicos %>% 
+  gt::gtsave(file.path(tab_folder, "3.4.tentativa.rtf"))
+tentativa_sel_toxicos %>% 
+  gt::gtsave(file.path(tab_folder, "3.4.tentativa.tex"))
+```
+  
+## Heatmaps - Tentativa de Suicidios  
+
+```{r}
+library("pheatmap")
+library(gridExtra)
+years_interes <- c(2019, 2020, 2021, 2022)
+agg_intox_sui <- generate_counts2(
+  intox_sui_fltd, 
+  date_column = "TIEMPO",
+  grouping_variables = c("CANTON", "SEXO", "GRUPO_ETARIO2", "TOXICO_INTERES1")) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+sui_ca_res <- analisis_correspondencia(agg_intox_sui, years_interes, include_sexo = T)
+sui_heatmap_19 <- pheatmap(sui_ca_res$ca_results_list$Y2019$cont_mat, cutree_rows = 4,
+                           scale = "none", display_numbers = T, main = "Año 2019")
+sui_heatmap_20 <- pheatmap(sui_ca_res$ca_results_list$Y2020$cont_mat, cutree_rows = 4,
+                           scale = "none", display_numbers = T, main = "Año 2020")
+sui_heatmap_21 <- pheatmap(sui_ca_res$ca_results_list$Y2021$cont_mat, cutree_rows = 4,
+                           scale = "none", display_numbers = T, main = "Año 2021")
+sui_heatmap_22 <- pheatmap(sui_ca_res$ca_results_list$Y2022$cont_mat, cutree_rows = 4,
+                           scale = "none", display_numbers = T, main = "Año 2022")
+sui_plot_list=list()
+sui_plot_list[[1]] = sui_heatmap_19[[4]]
+sui_plot_list[[2]] = sui_heatmap_20[[4]]
+sui_plot_list[[3]] = sui_heatmap_21[[4]]
+sui_plot_list[[4]] = sui_heatmap_22[[4]]
+sui_heatmaps <- do.call("grid.arrange", c(sui_plot_list, ncol=2))
+ggsave("sui_heatmaps.png", sui_heatmaps)
+```    
+  
+## Dynamic Time Warping Clustering - Tentativa de Suicidio  
+  
+https://damien-datasci-blog.netlify.app/post/time-series-clustering-with-dynamic-time-warp/  
+  
+### DTW - Medicamentos Varios - Edad y Sexo   
+  
+```{r fig.width=10, fig.height=15}
+intox_sui_med_vars <- intox_sui_fltd %>% 
+  filter(TOXICO_INTERES1 == "Medicamentos Varios")
+
+agg_intox_sui_med_vas_std <- generate_counts2(
+  intox_sui_med_vars, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_sui_med_vas <- generate_counts2(
+  intox_sui_med_vars, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_sui_med_vas_std, k_clusters = 2)
+generate_dtw_cluster_plot(agg_intox_sui_med_vas, k_clusters = 2)
+
+# Mujeres 12 a 19 años
+# Mujeres 20 a 60 años
+# Hombres 12 a 60 años
+
+intox_sui_med_vars <- intox_sui_med_vars %>% 
+  mutate(
+    SEXO_GE = paste(SEXO, "-", GRUPO_ETARIO2)
+  )
+
+get_cumulative_frequencies(intox_sui_med_vars, "SEXO_GE") %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+
+intox_sui_med_vars2 <- intox_sui_med_vars %>% 
+  filter(
+    GRUPO_ETARIO2 != "50 a 59 años"
+  ) %>% 
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      !GRUPO_ETARIO2 %in% c("12 a 19 años", "20 a 29 años") ~ "30 a 49 años",
+      TRUE ~ GRUPO_ETARIO2
+    )
+  )
+
+agg_intox_sui_med_vas2 <- generate_counts2(
+  intox_sui_med_vars2, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_sui_med_vas2, k_clusters = 2)
+
+intox_sui_med_vars3 <- intox_sui_med_vars %>% 
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      !GRUPO_ETARIO2 %in% c("12 a 19 años") ~ "20 a 49 años",
+      TRUE ~ GRUPO_ETARIO2
+    )
+  )
+
+agg_intox_sui_med_vas3 <- generate_counts2(
+  intox_sui_med_vars3, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_sui_med_vas3_std <- generate_counts2(
+  intox_sui_med_vars3, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_sui_med_vas3, k_clusters = 2)
+generate_dtw_cluster_plot(agg_intox_sui_med_vas3_std, k_clusters = 2)
+
+# Mujeres 12 a 19 años
+# Hombres 12 a 19 años
+# Hombres y mujeres de 20 a 50 años
+```
+
+### DTW - Medicamentos SNC - Edad y Sexo   
+  
+```{r fig.width=10, fig.height=15}
+intox_sui_med_snc <- intox_sui_fltd %>% 
+  filter(TOXICO_INTERES1 == "Medicamentos con acción a nivel del SNC")
+
+agg_intox_sui_med_snc <- generate_counts2(
+  intox_sui_med_snc, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2")) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_sui_med_snc, k_clusters = 2)
+
+intox_sui_med_snc <- intox_sui_med_snc %>% 
+  mutate(
+    SEXO_GE = paste(SEXO, "-", GRUPO_ETARIO2)
+  )
+
+get_cumulative_frequencies(intox_sui_med_snc, "SEXO_GE") %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+
+intox_sui_med_snc2 <- intox_sui_med_snc %>% 
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      !GRUPO_ETARIO2 %in% c("12 a 19 años", "20 a 29 años") ~ "30 a 59 años",
+      TRUE ~ GRUPO_ETARIO2
+    )
+  )
+
+agg_intox_sui_med_snc2 <- generate_counts2(
+  intox_sui_med_snc2, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_sui_med_snc2_std <- generate_counts2(
+  intox_sui_med_snc2, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_sui_med_snc2, k_clusters = 2)
+generate_dtw_cluster_plot(agg_intox_sui_med_snc2_std, k_clusters = 2)
+
+intox_sui_med_snc3 <- intox_sui_med_snc %>% 
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      !GRUPO_ETARIO2 %in% c("12 a 19 años") ~ "20 a 59 años",
+      TRUE ~ GRUPO_ETARIO2
+    )
+  )
+
+agg_intox_sui_med_snc3_std <- generate_counts2(
+  intox_sui_med_snc3, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_sui_med_snc3 <- generate_counts2(
+  intox_sui_med_snc3, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_sui_med_snc3_std, k_clusters = 2)
+generate_dtw_cluster_plot(agg_intox_sui_med_snc3, k_clusters = 2)
+
+# Mujeres 12 a 19 años
+# Hombres 12 a 19 años
+# Hombres y mujeres de 20 a 50 años
+```
+
+### DTW - Plaguicidas - Edad y Sexo   
+  
+```{r fig.width=10, fig.height=15}
+# intox_sui_plag <- intox_sui_fltd %>% 
+#   filter(TOXICO_INTERES1 == "Plaguicidas")
+# 
+# agg_intox_sui_plag <- generate_counts2(
+#   intox_sui_plag, 
+#   date_column = "TIEMPO",
+#   grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+#   standardize_counts = T) %>% 
+#   mutate(
+#     YEAR = lubridate::year(TIEMPO)
+#   )
+# 
+# generate_dtw_cluster_plot(agg_intox_sui_plag, k_clusters = 2)
+# 
+# intox_sui_plag2 <- intox_sui_plag %>% 
+#   mutate(
+#     GRUPO_ETARIO2 = case_when(
+#       !GRUPO_ETARIO2 %in% c("12 a 19 años") ~ "20 a 59 años",
+#       TRUE ~ GRUPO_ETARIO2
+#     )
+#   )
+# 
+# agg_intox_sui_plag2 <- generate_counts2(
+#   intox_sui_plag2, 
+#   date_column = "TIEMPO",
+#   grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+#   standardize_counts = F) %>% 
+#   mutate(
+#     YEAR = lubridate::year(TIEMPO)
+#   )
+# 
+# generate_dtw_cluster_plot(agg_intox_sui_plag2, k_clusters = 2)
+# La cantidad de datos asociada a plaguicidas es muy baja para el analisis de serie de tiempo, por lo que se enfocó el análisis en los medicamentos
+```
+
+### DTW - Medicamentos   
+
+```{r , fig.height=15, fig.width=10}
+intox_sui_fltd <- intox_sui_fltd %>% 
+  # filter(TOXICO_INTERES1 != "Plaguicidas") %>% 
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      !GRUPO_ETARIO2 %in% c("12 a 19 años") ~ "20 a 59 años",
+      TRUE ~ GRUPO_ETARIO2
+    )
+  )
+
+agg_intox_sui_filtd <- generate_counts2(
+  intox_sui_fltd, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_sui_filtd_std <- generate_counts2(
+  intox_sui_fltd, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_sui_filtd, k_clusters = 2)
+generate_dtw_cluster_plot(agg_intox_sui_filtd_std, k_clusters = 2)
+
+png(filename = file.path(img_folder, "3.5.tentativa_std.png"),
+    width = 920, height = 800, units = "px")
+generate_dtw_cluster_plot(agg_intox_sui_filtd_std, k_clusters = 3, lab_y = "Totales Estandarizados")
+dev.off()
+png(filename = file.path(img_folder, "3.6.tentativa.png"),
+    width = 920, height = 800, units = "px")
+generate_dtw_cluster_plot(agg_intox_sui_filtd, k_clusters = 3, lab_y = "Total de Casos Reportados")
+dev.off()
+
+intox_sui_fltd <- intox_sui_fltd %>% 
+  mutate(
+    TOXICO_INTERES1 = "Medicamentos"
+  )
+
+agg_intox_sui_filtd_std2 <- generate_counts2(
+  intox_sui_fltd, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "GRUPO_ETARIO2", "TOXICO_INTERES1"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_sui_filtd_std2, k_clusters = 2)
+
+agg_intox_sui_filtd <- generate_counts2(
+  intox_sui_fltd, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "GRUPO_ETARIO2", "TOXICO_INTERES1"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_sui_filtd, k_clusters = 2)
+
+intox_sui_fltd <- intox_sui_fltd %>% 
+  mutate(
+    SEXO_GE = paste(SEXO, "-", GRUPO_ETARIO2)
+  )
+
+get_cumulative_frequencies(intox_sui_fltd, "SEXO_GE") %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+
+# Se decidió trabajar con personas entre 20 y 59 años y mujeres de 12 a 19 años que equivalieron a un 92% de los casos por intoxicación con medicamentos de tentativa de suicidio
+```
+
+```{r}
+f19_sui_data <- intox_sui_fltd %>% 
+  filter(EDAD_A <= 19 & EDAD_A >= 12)
+
+(f19_sui_data %>%
+  select(YEAR, TOXICO1) %>% 
+  tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(TOXICO1 = "Tóxico Principal"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**"))
+```  
+
+```{r}
+adu_sui_data <- intox_sui_fltd %>% 
+  filter(EDAD_A <= 59 & EDAD_A >= 20)
+
+(adu_sui_data %>%
+  select(YEAR, TOXICO1) %>% 
+  tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(TOXICO1 = "Tóxico Principal"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**"))
+```  
+
+## Tentativa de Suicidios - Mujeres 12 a 19 años
+
+```{r}
+sui_f19 <- get_ts_from_agg_df(agg_intox_sui_filtd, 
+                                 filtro_etario = "12 a 19 años",
+                                 filtro_sexo = "Femenino")
+
+(f19_sui_prop <- sum(sui_f19$ts_full)/nrow(intox_sui))
+
+sui_f19_tsibble <- sui_f19$agg_data %>% 
+  as_tsibble(index = TIEMPO) %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO))
+
+sui_f19_train <- sui_f19_tsibble %>% 
+  filter(TIEMPO < tsibble::yearmonth("2020-03"))
+sui_f19_test <- sui_f19_tsibble %>% 
+  filter(TIEMPO >= tsibble::yearmonth("2020-03"))
+
+sui_f19_train18 <- sui_f19_tsibble %>% 
+  filter(TIEMPO < tsibble::yearmonth("2018-01"))
+sui_f19_test18 <- sui_f19_tsibble %>% 
+  filter(TIEMPO >= tsibble::yearmonth("2018-01"))
+
+sui_f19_train19 <- sui_f19_tsibble %>% 
+  filter(TIEMPO < tsibble::yearmonth("2019-01"))
+sui_f19_test19 <- sui_f19_tsibble %>% 
+  filter(TIEMPO >= tsibble::yearmonth("2019-01"))
+```
+
+### Changepoint - Enfoque cambio de nivel
+
+```{r}
+sui_f19_cpts <- get_change_points(sui_f19$ts_full)
+sui_f19_cpts$cp_plot
+```
+
+### Outliers - Enfoque de valores extremos  
+  
+```{r}
+sui_f19_outliers <- forecast::tsoutliers(sui_f19$ts_full, lambda = NULL, iterate = 100)
+zoo::as.Date(sui_f19$ts_full)[sui_f19_outliers$index]
+```
+  
+### ARIMA - Enfoque Intervencion  
+  
+#### Estacionariedad y Autocorrelogramas Intervención   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+# DescTools::PlotACF(sui_f19$ts_full, main = "")
+
+sui_f19_tsibble %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+sui_f19_tsibble |>
+  features(TOTAL, unitroot_nsdiffs)
+
+sui_f19_tsibble |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+sui_f19_tsibble |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+sui_f19_tsibble |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportado entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+sui_f19_tsibble |>
+  gg_tsdisplay(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+sui_f19_tsibble |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  labs(title = "Diferenciado", y="")
+
+png(filename = file.path(img_folder, "3.5.tentativa.png"),
+    width = 720, height = 480, units = "px")
+sui_f19_tsibble |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36)  +
+  ylab("Total Diferenciado (1)")
+dev.off()
+```  
+  
+#### Modelaje Intervención  
+  
+##### Selección del Modelo  
+  
+```{r}
+inter <- c(rep(0, 62), rep(1, 34))
+timeperiod <- 96
+
+# sui_f19_inter_model <- sui_f19_tsibble %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE))
+
+sui_f19_inter_model <- sui_f19_tsibble %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_100_auto = ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE), #auto
+    arima_010 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,0) + inter),
+    arima_011 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,0) + inter),
+    arima_110 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,0) + inter),
+    arima_111 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,0) + inter),
+    arima_012 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(0,0,0) + inter),
+    arima_210 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,0) + inter),
+    arima_112 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(0,0,0) + inter),
+    arima_211 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,0) + inter),
+    arima_212 = ARIMA(TOTAL ~ pdq(2,1,2) + PDQ(0,0,0) + inter),
+    
+    arima_310 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,0) + inter),
+    arima_311 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,0) + inter),
+    arima_312 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(0,0,0) + inter),
+    
+    arima_410 = ARIMA(TOTAL ~ pdq(4,1,0) + PDQ(0,0,0) + inter),
+    arima_411 = ARIMA(TOTAL ~ pdq(4,1,1) + PDQ(0,0,0) + inter),
+    arima_412 = ARIMA(TOTAL ~ pdq(4,1,2) + PDQ(0,0,0) + inter),
+    
+    arima_010_001_4 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,1, period = 4) + inter),
+    arima_011_001_4 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,1, period = 4) + inter),
+    arima_110_001_4 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,1, period = 4) + inter),
+    arima_111_001_4 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,1, period = 4) + inter),
+    arima_012_001_4 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(0,0,1, period = 4) + inter),
+    arima_210_001_4 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,1, period = 4) + inter),
+    arima_112_001_4 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(0,0,1, period = 4) + inter),
+    arima_211_001_4 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,1, period = 4) + inter),
+    arima_212_001_4 = ARIMA(TOTAL ~ pdq(2,1,2) + PDQ(0,0,1, period = 4) + inter),
+  )
+
+sui_f19_inter_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(sui_f19_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(ttf_arima_table <- glance(sui_f19_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ))
+
+ttf_arima_int_gt <- ttf_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+ttf_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.5.tentativa_teens_arima_int.rtf"))
+ttf_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.5.tentativa_teens_arima_int.tex"))
+
+sui_f19_inter_sel_model <- sui_f19_inter_model |>
+  select(arima_410)
+
+sui_f19_inter_sel_model |>
+  report()
+
+ttf_inter_arima_gt <- sui_f19_inter_sel_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "inter" ~ "Intervención",
+      term == "intercept" ~ "Intercepto",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+ttf_inter_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.6.tentativa_teens_arima_int_mod.rtf"))
+ttf_inter_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.6.tentativa_teens_arima_int_mod.tex"))
+
+
+png(filename = file.path(img_folder, "3.7.tentativa_teens_int_resids.png"),
+    width = 720, height = 480, units = "px")
+sui_f19_inter_sel_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+
+sui_f19_inter_sel_model |> 
+  gg_tsresiduals(lag=timeperiod)
+```
+  
+##### Verificación de Supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(sui_f19_inter_lb <- augment(sui_f19_inter_model) |>
+  filter(.model == "arima_410") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 4))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+  
+###### Raíces Unitarias  
+  
+```{r}
+sui_f19_inter_sel_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "3.6.tentativa_teens_int_roots.png"),
+    width = 720, height = 480, units = "px")
+sui_f19_inter_sel_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+  
+###### Normalidad de los residuos  
+  
+```{r}
+# Normalidad de Residuos - ARIMA
+sui_f19_inter_ts_residuals <- residuals(sui_f19_inter_sel_model, 
+                                    type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(sui_f19_inter_ts_residuals)
+
+(sui_f19_inter_jb_arima <- tseries::jarque.bera.test(sui_f19_inter_ts_residuals))
+
+(sui_f19_inter_shap_arima <-shapiro.test(sui_f19_inter_ts_residuals))
+
+car::qqPlot(sui_f19_inter_ts_residuals)
+
+# Normalidad de residuos - Regresion
+sui_f19_inter_reg_residuals <- residuals(sui_f19_inter_sel_model, type = "regression") %>% as_tibble() %>% pull(.resid)
+
+mean(sui_f19_inter_reg_residuals)
+
+(sui_f19_inter_shap_reg <- shapiro.test(sui_f19_inter_reg_residuals))
+
+car::qqPlot(sui_f19_inter_reg_residuals)
+
+# Visualizacion ambos graficos
+bind_rows(
+    `Regression residuals` =
+        as_tibble(residuals(sui_f19_inter_sel_model, type = "regression")),
+    `ARIMA residuals` =
+        as_tibble(residuals(sui_f19_inter_sel_model, type = "innovation")),
+    .id = "type"
+  ) |>
+  mutate(
+    TIEMPO = as_date(TIEMPO)
+  ) |>
+  ggplot(aes(x = TIEMPO, y = .resid)) +
+  geom_line() +
+  facet_grid(vars(type))
+```
+  
+##### Agrupación de resultados  
+  
+```{r}
+(summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Tentativa de Suicidio con Medicamentos",
+    Población = "Mujeres entre 12 y 19 años",
+    Enfoque = "Intervención",
+    Modelo = "Regresion con ARIMA (4,1,0)",
+    # Significancia_intervencion = "No",
+    # ACF_Residuales = "1 de 96 fuera",
+    # Histograma = "Aproximadamente Normal con valores extremos en ambas colas",
+    Residuals_LJung_Box_Test_ARIMA = round(sui_f19_inter_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(sui_f19_inter_jb_arima$p.value, 2),
+    # Residuals_Shapiro_Test_ARIMA = round(sui_f19_inter_shap_arima$p.value, 2),
+    Residuals_Shapiro_Wilk_Regression = round(sui_f19_inter_shap_reg$p.value, 2)
+  )))
+```
+  
+#### ARIMA - Enfoque Pronostico  
+  
+#### Estacionariedad y Autocorrelogramas Pronóstico   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+sui_f19_train %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+sui_f19_train |>
+  features(TOTAL, unitroot_nsdiffs)
+
+sui_f19_train |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+sui_f19_train |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+sui_f19_train |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+sui_f19_train |>
+  gg_tsdisplay(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+  
+png(filename = file.path(img_folder, "3.8.tentativa_teens_pron_dif.png"),
+    width = 720, height = 480, units = "px")
+sui_f19_train |>
+  gg_tsdisplay_spanish(TOTAL,
+               plot_type='partial', lag=36) +
+  ylab("Total de Casos Reportados")
+dev.off()
+```    
+  
+#### Modelaje Pronóstico     
+  
+##### Selección del Modelo  
+  
+```{r}
+# sui_f19_pron_model <- sui_f19_train %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE))
+# 
+# sui_f19_pron_model |>
+#   pivot_longer(everything(),
+#                names_to = "Model name",
+#                values_to = "Orders")
+
+sui_f19_pron_model <- sui_f19_train %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_100_auto = ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE),
+    arima_000 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,0,0)),
+    arima_001 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,0,0)),
+    arima_100 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,0,0)),
+    arima_101 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,0,0))
+  )
+
+sui_f19_pron_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(sui_f19_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(ttf_pron_arima_table <- glance(sui_f19_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ) %>% 
+  slice(-1))
+
+tft_arima_pron_gt <- ttf_pron_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+tft_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.7.tentativa_teens_arima_pron.rtf"))
+tft_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.7.tentativa_teens_arima_pron.tex"))
+
+sui_f19_final_arima_model <- sui_f19_pron_model |>
+  select(arima_100) 
+
+sui_f19_final_arima_model |>
+  report()
+
+ttf_pron_arima_gt <- sui_f19_final_arima_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "constant" ~ "Constante",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+ttf_pron_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.8.tentativa_teens_arima_pron_mod.rtf"))
+ttf_pron_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.8.tentativa_teens_arima_pron_mod.tex"))
+
+png(filename = file.path(img_folder, "3.10.tentativa_teens_pron_resids.png"),
+    width = 720, height = 480, units = "px")
+sui_f19_final_arima_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+
+sui_f19_final_arima_model |> 
+  gg_tsresiduals(lag=timeperiod)
+```
+  
+##### Verificación de supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(sui_f19_lb <-  augment(sui_f19_pron_model) |>
+  filter(.model == "arima_100") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 1))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+   
+###### Raíces Unitarias
+   
+```{r}
+sui_f19_final_arima_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "3.9.tentativa_teens_pron_roots.png"),
+    width = 720, height = 480, units = "px")
+sui_f19_final_arima_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+   
+###### Normalidad de los residuos   
+   
+```{r}
+# Normalidad de Residuos - ARIMA
+sui_f19_residuals <- residuals(sui_f19_final_arima_model, type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(sui_f19_residuals)
+
+(sui_f19_jb_arima <- tseries::jarque.bera.test(sui_f19_residuals))
+
+(sui_f19_shap_arima <- shapiro.test(sui_f19_residuals))
+
+car::qqPlot(sui_f19_residuals)
+```
+   
+##### Agrupación de Resultados   
+   
+```{r}
+sui_f19_pron <- gen_pronostic_plot2(sui_f19_train, 
+                                      sui_f19_test,
+                                      sui_f19_final_arima_model,
+                                      h_forecast = 34)
+
+sui_f19_pron$pron_df <- sui_f19_pron$pron_df %>% 
+  mutate(
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(sui_f19_pron$pron_df$out)
+sui_f19_pron$pron_df$ds[sui_f19_pron$pron_df$out == 1]
+
+sui_f19_arima_sel_df <- forecast::accuracy(sui_f19_pron$pron_df$yhat,
+                                                    sui_f19_pron$pron_df$y) %>%
+  as_tibble() %>% 
+  mutate(Modelo = "ARIMA (1,0,0)",
+         Metric_Type = "Test set")
+
+summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Tentativa de Suicidio con Medicamentos",
+    Población = "Mujeres entre 12 y 19 años",
+    Enfoque = "Pronóstico",
+    Modelo = "ARIMA (1,0,0)",
+    ACF_Residuales = "Todos dentro",
+    # Histograma = "Aproximadamente Normal",
+    Residuals_LJung_Box_Test_ARIMA = round(sui_f19_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(sui_f19_jb_arima$p.value, 2),
+    # Residuals_Shapiro_Test_ARIMA = round(sui_f19_shap_arima$p.value, 2)
+  ))
+```
+    
+#### Prophet - Enfoque Pronóstico
+  
+##### Original 2020  
+  
+```{r}
+# sui_f19_prophet_mod <- generate_prophet_forecast(sui_f19_train,
+#                                               sui_f19_test,
+#                                               periods = 34)
+# write_rds(sui_f19_prophet_mod, "modelos/sui_f19_prophet.RDS")
+sui_f19_prophet <- readRDS("modelos/sui_f19_prophet.RDS")
+
+sui_f19_prophet$acc_consolidated %>%
+  mutate(model = 1:nrow(sui_f19_prophet$acc_consolidated)) %>% 
+  arrange(RMSE, MAPE)
+
+sui_f19_sel_prophet <- 60
+
+ttf_forecast_tb <- sui_f19_prophet$forecast_tb_list[[sui_f19_sel_prophet]] %>% 
+  mutate(
+    y = sui_f19_pron$pron_df$y,
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(ttf_forecast_tb$out)
+ttf_forecast_tb$ds[ttf_forecast_tb$out == 1]
+
+sui_f19_prophet_plot <- generate_prophet_plot(sui_f19$ts_train, 
+                      sui_f19$ts_test, 
+                      forecast_tb = sui_f19_prophet$forecast_tb_list[[sui_f19_sel_prophet]])
+
+(ttf_both_metrics <- combine_model_metrics(sui_f19_arima_sel_df, 
+                      sui_f19_prophet$acc_consolidated[sui_f19_sel_prophet,]) %>% 
+    mutate_if(is.numeric, ~round(., 2)) %>% 
+    select(Modelo, RMSE, MAPE) %>% 
+  arrange(RMSE, MAPE))
+
+ttf_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "3.9.tentativa_teens_proph_arima.rtf"))
+ttf_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "3.9.tentativa_teens_proph_arima.tex"))
+```  
+  
+###### Gráficos de pronóstico
+  
+```{r}
+cowplot::plot_grid(sui_f19_pron$arima_plot, 
+                  sui_f19_prophet_plot, 
+                  labels = c('Arima', 'Prophet'))
+
+library(cowplot)
+ttf_plots_aligned  <- align_plots(sui_f19_pron$arima_plot + theme(legend.position = "none")  + ggtitle('ARIMA (1,0,0)'), 
+                     sui_f19_prophet_plot + theme(legend.position = "none")  + ggtitle('Prophet'),
+                     align = 'v', 
+                     axis = 'l')
+
+ttf_arima_legend <- get_legend(sui_f19_pron$arima_plot)
+
+(ttf_final_plot <- cowplot::plot_grid(ttf_plots_aligned[[1]], 
+                   ttf_plots_aligned[[2]], 
+                  ttf_arima_legend, 
+                  label_size = 10,
+                  rel_heights =  c(1, 1, .1),
+                  nrow = 3))
+
+png(filename = file.path(img_folder, "3.11.tentativa_teens_pron_final.png"),
+    width = 720, height = 520, units = "px")
+ttf_final_plot
+dev.off()
+```  
+  
+##### 2018  
+  
+```{r}
+# sui_f19_prophet_mod18 <- generate_prophet_forecast(sui_f19_train18,
+#                                               sui_f19_test18,
+#                                               periods = 12*5)
+
+# write_rds(sui_f19_prophet_mod18, "modelos/sui_f19_prophet18.RDS")
+sui_f19_prophet18 <- readRDS("modelos/sui_f19_prophet18.RDS")
+
+sui_f19_prophet$acc_consolidated %>%
+  mutate(model = 1:nrow(sui_f19_prophet18$acc_consolidated)) %>% 
+  arrange(RMSE, MAPE)
+
+sui_f19_sel_prophet18 <- 60
+sui_f19_prophet_plot18 <- generate_prophet_plot(sui_f19_train18, 
+                      sui_f19_test18, 
+                      forecast_tb = sui_f19_prophet18$forecast_tb_list[[sui_f19_sel_prophet18]])
+
+sui_f19_prophet_plot18 
+```    
+  
+##### 2019  
+  
+```{r}
+# sui_f19_prophet_mod19 <- generate_prophet_forecast(sui_f19_train19,
+#                                               sui_f19_test19,
+#                                               periods = 12*4)
+# 
+# write_rds(sui_f19_prophet_mod19, "modelos/sui_f19_prophet19.RDS")
+sui_f19_prophet19 <- readRDS("modelos/sui_f19_prophet19.RDS")
+
+sui_f19_prophet$acc_consolidated %>%
+  mutate(model = 1:nrow(sui_f19_prophet19$acc_consolidated)) %>% 
+  arrange(RMSE, MAPE)
+
+sui_f19_sel_prophet19 <- 60
+sui_f19_prophet_plot19 <- generate_prophet_plot(sui_f19_train19, 
+                      sui_f19_test19, 
+                      forecast_tb = sui_f19_prophet19$forecast_tb_list[[sui_f19_sel_prophet19]])
+
+sui_f19_prophet_plot19
+```      
+  
+## Tentativa de suicidio - Adultos de 20 a 59 años
+
+```{r}
+sui_adultos <- get_ts_from_agg_df(agg_intox_sui_filtd, 
+                                  filtro_etario = "20 a 59 años")
+
+(sui_adultos_prop <- sum(sui_adultos$ts_full)/nrow(intox_sui))
+
+sui_adultos_tsibble <- sui_adultos$agg_data %>% 
+  as_tsibble(index = TIEMPO) %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO))
+
+sui_adultos_train <- sui_adultos_tsibble %>% 
+  filter(TIEMPO < tsibble::yearmonth("2020-03"))
+sui_adultos_test <- sui_adultos_tsibble %>% 
+  filter(TIEMPO >= tsibble::yearmonth("2020-03"))
+
+sui_adultos_train18 <- sui_adultos_tsibble %>% 
+  filter(TIEMPO < tsibble::yearmonth("2018-01"))
+sui_adultos_test18 <- sui_adultos_tsibble %>% 
+  filter(TIEMPO >= tsibble::yearmonth("2018-01"))
+
+sui_adultos_train19 <- sui_adultos_tsibble %>% 
+  filter(TIEMPO < tsibble::yearmonth("2019-01"))
+sui_adultos_test19 <- sui_adultos_tsibble %>% 
+  filter(TIEMPO >= tsibble::yearmonth("2019-01"))
+```  
+  
+### Changepoint - Enfoque cambio de nivel
+
+```{r}
+sui_adultos_cpts <- get_change_points(sui_adultos$ts_full)
+sui_adultos_cpts$cp_plot
+```
+  
+### ARIMA - Enfoque Intervencion  
+  
+#### Estacionariedad y Autocorrelogramas Intervención   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+# DescTools::PlotACF(sui_adultos$ts_full, main = "")
+
+sui_adultos_tsibble %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+sui_adultos_tsibble |>
+  features(TOTAL, unitroot_nsdiffs)
+
+sui_adultos_tsibble |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+sui_adultos_tsibble |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+sui_adultos_tsibble |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+sui_adultos_tsibble |>
+  gg_tsdisplay(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+sui_adultos_tsibble |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  labs(title = "Diferenciado", y="")
+
+
+png(filename = file.path(img_folder, "3.12.tentativa_adultos.png"),
+    width = 720, height = 480, units = "px")
+sui_adultos_tsibble |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36)  +
+  ylab("Total Diferenciado (1)")
+dev.off()
+```  
+  
+#### Modelaje Intervención  
+  
+##### Selección del Modelo  
+  
+```{r}
+inter <- c(rep(0, 62), rep(1, 34))
+timeperiod <- 96
+
+# sui_adultos_inter_model <- sui_adultos_tsibble %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE))
+
+sui_adultos_inter_model <- sui_adultos_tsibble %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_100_auto = ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE), #auto
+    arima_010 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,0) + inter),
+    arima_011 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,0) + inter),
+    arima_110 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,0) + inter),
+    arima_111 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,0) + inter),
+    arima_210 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,0) + inter),
+    arima_212 = ARIMA(TOTAL ~ pdq(2,1,2) + PDQ(0,0,0) + inter),
+    
+    arima_310 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,0) + inter),
+    arima_311 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,0) + inter),
+
+    arima_410 = ARIMA(TOTAL ~ pdq(4,1,0) + PDQ(0,0,0) + inter),
+    arima_411 = ARIMA(TOTAL ~ pdq(4,1,1) + PDQ(0,0,0) + inter),
+    
+    arima_010_100_4 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 4) + inter),
+    arima_011_100_4 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 4) + inter),
+    arima_110_100_4 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 4) + inter),
+    arima_111_100_4 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 4) + inter),
+    arima_210_100_4 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,0, period = 4) + inter),
+    arima_212_100_4 = ARIMA(TOTAL ~ pdq(2,1,2) + PDQ(1,0,0, period = 4) + inter),
+    
+    arima_010_001_4 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,1, period = 4) + inter),
+    arima_011_001_4 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,1, period = 4) + inter),
+    arima_110_001_4 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,1, period = 4) + inter),
+    arima_111_001_4 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,1, period = 4) + inter),
+    arima_210_001_4 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,1, period = 4) + inter),
+    arima_212_001_4 = ARIMA(TOTAL ~ pdq(2,1,2) + PDQ(0,0,1, period = 4) + inter),
+    arima_310_001_4 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,1, period = 4) + inter),
+    arima_311_001_4 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,1, period = 4) + inter),
+    arima_410_001_4 = ARIMA(TOTAL ~ pdq(4,1,0) + PDQ(0,0,1, period = 4) + inter),
+    arima_411_001_4 = ARIMA(TOTAL ~ pdq(4,1,1) + PDQ(0,0,1, period = 4) + inter),
+    
+    arima_010_001_5 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,1, period = 5) + inter),
+    arima_011_001_5 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,1, period = 5) + inter),
+    arima_110_001_5 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,1, period = 5) + inter),
+    arima_111_001_5 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,1, period = 5) + inter),
+    arima_210_001_5 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,1, period = 5) + inter),
+    arima_212_001_5 = ARIMA(TOTAL ~ pdq(2,1,2) + PDQ(0,0,1, period = 5) + inter),
+    arima_310_001_5 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,1, period = 5) + inter),
+    arima_311_001_5 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,1, period = 5) + inter),
+    arima_410_001_5 = ARIMA(TOTAL ~ pdq(4,1,0) + PDQ(0,0,1, period = 5) + inter),
+    arima_411_001_5 = ARIMA(TOTAL ~ pdq(4,1,1) + PDQ(0,0,1, period = 5) + inter),
+    
+    arima_010_001_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_011_001_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,1, period = 6) + inter),
+    arima_110_001_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_111_001_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,1, period = 6) + inter),
+    arima_210_001_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_212_001_6 = ARIMA(TOTAL ~ pdq(2,1,2) + PDQ(0,0,1, period = 6) + inter),
+    arima_310_001_6 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_311_001_6 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,1, period = 6) + inter),
+    arima_410_001_6 = ARIMA(TOTAL ~ pdq(4,1,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_411_001_6 = ARIMA(TOTAL ~ pdq(4,1,1) + PDQ(0,0,1, period = 6) + inter),
+    
+    arima_010_001_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_011_001_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,1, period = 12) + inter),
+    arima_110_001_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_111_001_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,1, period = 12) + inter),
+    arima_210_001_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_212_001_12 = ARIMA(TOTAL ~ pdq(2,1,2) + PDQ(0,0,1, period = 12) + inter),
+    arima_310_001_12 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_311_001_12 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,1, period = 12) + inter),
+    arima_410_001_12 = ARIMA(TOTAL ~ pdq(4,1,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_411_001_12 = ARIMA(TOTAL ~ pdq(4,1,1) + PDQ(0,0,1, period = 12) + inter),
+  )
+
+sui_adultos_inter_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(sui_adultos_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(tta_arima_table <- glance(sui_adultos_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ))
+
+tta_arima_int_gt <- tta_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+tta_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.10.tentativa_adultos_arima_int.rtf"))
+tta_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.10.tentativa_asultos_arima_int.tex"))
+
+sui_adultos_inter_sel_model <- sui_adultos_inter_model |>
+  select(arima_011_001_5)
+
+# arima_011_001_5 tiene componentes significativos, se descarta por parsimonia y porque un ciclo de 5 meses no hace sentido para este escenario.
+# arima_111_001_5 el ar no es significativo
+
+sui_adultos_inter_sel_model |>
+  report()
+
+tta_inter_arima_gt <- sui_adultos_inter_sel_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "inter" ~ "Intervención",
+      term == "intercept" ~ "Intercepto",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+tta_inter_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.11.tentaitva_adultos_arima_int_mod.rtf"))
+tta_inter_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.11.tentaitva_adultos_arima_int_mod.tex"))
+
+png(filename = file.path(img_folder, "3.14.tentativa_adultos_int_resids.png"),
+    width = 720, height = 480, units = "px")
+sui_adultos_inter_sel_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+
+sui_adultos_inter_sel_model |> 
+  gg_tsresiduals(lag=timeperiod)
+```
+  
+##### Verificación de Supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(sui_adultos_inter_lb <- augment(sui_adultos_inter_model) |>
+  filter(.model == "arima_011_001_5") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 2))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+  
+###### Raíces Unitarias  
+  
+```{r}
+sui_adultos_inter_sel_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "3.13.tentativa_adultos_int_roots.png"),
+    width = 720, height = 480, units = "px")
+sui_adultos_inter_sel_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+  
+###### Normalidad de los residuos  
+  
+```{r}
+# Normalidad de Residuos - ARIMA
+sui_adultos_inter_ts_residuals <- residuals(sui_adultos_inter_sel_model, 
+                                    type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(sui_adultos_inter_ts_residuals)
+
+(sui_adultos_inter_jb_arima <- tseries::jarque.bera.test(sui_adultos_inter_ts_residuals))
+
+(sui_adultos_inter_shap_arima <-shapiro.test(sui_adultos_inter_ts_residuals))
+
+car::qqPlot(sui_adultos_inter_ts_residuals)
+
+# Normalidad de residuos - Regresion
+sui_adultos_inter_reg_residuals <- residuals(sui_adultos_inter_sel_model, type = "regression") %>% as_tibble() %>% pull(.resid)
+
+mean(sui_adultos_inter_reg_residuals)
+
+(sui_adultos_inter_shap_reg <- shapiro.test(sui_adultos_inter_reg_residuals))
+
+car::qqPlot(sui_adultos_inter_reg_residuals)
+
+# Visualizacion ambos graficos
+bind_rows(
+    `Regression residuals` =
+        as_tibble(residuals(sui_adultos_inter_sel_model, type = "regression")),
+    `ARIMA residuals` =
+        as_tibble(residuals(sui_adultos_inter_sel_model, type = "innovation")),
+    .id = "type"
+  ) |>
+  mutate(
+    TIEMPO = as_date(TIEMPO)
+  ) |>
+  ggplot(aes(x = TIEMPO, y = .resid)) +
+  geom_line() +
+  facet_grid(vars(type))
+```
+  
+##### Agrupación de resultados  
+  
+```{r}
+(summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Tentativa de suicidio con medicamentos",
+    Población = "Edades entre 20 y 59 años",
+    Enfoque = "Intervención",
+    Modelo = "Regresion con ARIMA (0,1,1)",
+    # Significancia_intervencion = "No",
+    # ACF_Residuales = "1 de 96 fuera",
+    # Histograma = "Aproximadamente Normal sesgado a la derecha",
+    Residuals_LJung_Box_Test_ARIMA = round(sui_adultos_inter_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(sui_adultos_inter_jb_arima$p.value, 2),
+    # Residuals_Shapiro_Test_ARIMA = round(sui_adultos_inter_shap_arima$p.value, 2),
+    Residuals_Shapiro_Wilk_Regression = round(sui_adultos_inter_shap_reg$p.value, 2)
+  )))
+```        
+  
+#### ARIMA - Enfoque Pronostico  
+  
+#### Estacionariedad y Autocorrelogramas Pronóstico   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+sui_adultos_train %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+sui_adultos_train |>
+  features(TOTAL, unitroot_nsdiffs)
+
+sui_adultos_train |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+sui_adultos_train |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+sui_adultos_train |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+sui_adultos_train |>
+  gg_tsdisplay(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+png(filename = file.path(img_folder, "3.15.tentativa_adultos_pron_dif.png"),
+    width = 720, height = 480, units = "px")
+sui_adultos_train |>
+  gg_tsdisplay_spanish(TOTAL,
+               plot_type='partial', lag=36) +
+  ylab("Total de Casos Reportados")
+dev.off()
+```    
+  
+#### Modelaje Pronóstico     
+  
+##### Selección del Modelo  
+  
+```{r}
+# sui_adultos_pron_model <- sui_adultos_train %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE))
+# 
+# sui_adultos_pron_model |>
+#   pivot_longer(everything(),
+#                names_to = "Model name",
+#                values_to = "Orders")
+
+sui_adultos_pron_model <- sui_adultos_train %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_005_001_12_auto = ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE),
+    arima_000 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,0,0)),
+    arima_001 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,0,0)),
+    arima_100 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,0,0)),
+    arima_101 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,0,0)),
+    arima_002 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(0,0,0)),
+    arima_102 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(0,0,0))
+  )
+
+sui_adultos_pron_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(sui_adultos_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(tta_pron_arima_table <- glance(sui_adultos_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ))
+
+tta_arima_pron_gt <- tta_pron_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+tta_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.12.tentativa_adultos_arima_pron.rtf"))
+tta_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.12.tentativa_adultos_arima_pron.tex"))
+
+sui_adultos_final_arima_model <- sui_adultos_pron_model |>
+  select(arima_005_001_12_auto) 
+
+sui_adultos_final_arima_model |>
+  report()
+
+tta_arima_gt <- sui_adultos_final_arima_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "constant" ~ "Constante",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+tta_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.13.tentativa_adultos_arima_pron_mod.rtf"))
+tta_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "3.13.tentativa_adultos_arima_pron_mod.tex"))
+
+png(filename = file.path(img_folder, "3.17.tentativa_adultos_pron_resids.png"),
+    width = 720, height = 480, units = "px")
+sui_adultos_final_arima_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+
+sui_adultos_final_arima_model |> 
+  gg_tsresiduals(lag=timeperiod)
+```
+  
+##### Verificación de supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(sui_adultos_lb <-  augment(sui_adultos_pron_model) |>
+  filter(.model == "arima_005_001_12_auto") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 6))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+   
+###### Raíces Unitarias
+   
+```{r}
+sui_adultos_final_arima_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "3.16.tentativa_adultos_pron_roots.png"),
+    width = 720, height = 480, units = "px")
+sui_adultos_final_arima_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+   
+###### Normalidad de los residuos   
+   
+```{r}
+# Normalidad de Residuos - ARIMA
+sui_adultos_residuals <- residuals(sui_adultos_final_arima_model, type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(sui_adultos_residuals)
+
+(sui_adultos_jb_arima <- tseries::jarque.bera.test(sui_adultos_residuals))
+
+(sui_adultos_shap_arima <- shapiro.test(sui_adultos_residuals))
+
+car::qqPlot(sui_adultos_residuals)
+```
+   
+##### Agrupación de Resultados   
+   
+```{r}
+sui_adultos_pron <- gen_pronostic_plot2(sui_adultos_train, 
+                                      sui_adultos_test,
+                                      sui_adultos_final_arima_model,
+                                      h_forecast = 34)
+
+sui_adultos_pron$pron_df <- sui_adultos_pron$pron_df %>% 
+  mutate(
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(sui_adultos_pron$pron_df$out)
+sui_adultos_pron$pron_df$ds[sui_adultos_pron$pron_df$out == 1]
+
+sui_adultos_arima_sel_df <- forecast::accuracy(sui_adultos_pron$pron_df$yhat,
+                                                    sui_adultos_pron$pron_df$y) %>%
+  as_tibble() %>% 
+  mutate(Modelo = "ARIMA (0,0,5)(0,0,1)[12]",
+         Metric_Type = "Test set")
+
+summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Tentativa de Suicidio con Medicamentos",
+    Población = "Edades entre 20 y 59 años",
+    Enfoque = "Pronóstico",
+    Modelo = "ARIMA (0,0,5)(0,0,1)[12]",
+    # ACF_Residuales = "Todos dentro",
+    # Histograma = "Aproximadamente Normal con dos valores extremos a la derecha",
+    Residuals_LJung_Box_Test_ARIMA = round(sui_adultos_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(sui_adultos_jb_arima$p.value, 2)
+    # Residuals_Shapiro_Test_ARIMA = round(sui_adultos_shap_arima$p.value, 2)
+  ))
+```
+  
+#### Prophet - Enfoque Pronóstico
+  
+##### Original 2020  
+  
+```{r}
+# sui_adultos_prophet_mod <- generate_prophet_forecast(sui_adultos_train,
+#                                               sui_adultos_test,
+#                                               periods = 34)
+# write_rds(sui_adultos_prophet_mod, "modelos/sui_adultos_prophet.RDS")
+sui_adultos_prophet <- readRDS("modelos/sui_adultos_prophet.RDS")
+
+sui_adultos_prophet$acc_consolidated %>%
+  mutate(model = 1:nrow(sui_adultos_prophet$acc_consolidated)) %>% 
+  arrange(RMSE, MAPE)
+
+sui_adultos_sel_prophet <- 52
+
+tta_forecast_tb <- sui_adultos_prophet$forecast_tb_list[[sui_adultos_sel_prophet]] %>% 
+  mutate(
+    y = sui_adultos_pron$pron_df$y,
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(tta_forecast_tb$out)
+tta_forecast_tb$ds[tta_forecast_tb$out == 1]
+
+sui_adultos_prophet_mod <- sui_adultos_prophet$forecast_tb_list[[sui_adultos_sel_prophet]] %>% 
+  left_join(sui_adultos_test %>% mutate(TIEMPO = as_date(TIEMPO)), by = c("ds" = "TIEMPO")) %>% 
+  mutate(
+    year = year(ds),
+    in_out = case_when(
+      TOTAL <= yhat_upper & TOTAL >= yhat_lower ~ "In",
+      TRUE ~ "Out"
+    )
+  ) %>% 
+  group_by(year) %>% 
+  mutate(
+    prop_in = sum(in_out == "In")/n(),
+    label = "2020-03 and up"
+  )
+sui_adultos_prophet_plot <- generate_prophet_plot(sui_adultos$ts_train, 
+                      sui_adultos$ts_test, 
+                      forecast_tb = sui_adultos_prophet_mod)
+
+(tta_both_metrics <- combine_model_metrics(sui_adultos_arima_sel_df, 
+                      sui_adultos_prophet$acc_consolidated[sui_adultos_sel_prophet,]) %>% 
+    mutate_if(is.numeric, ~round(., 2)) %>% 
+    select(Modelo, RMSE, MAPE) %>% 
+  arrange(RMSE, MAPE))
+
+tta_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "3.14.tentativa_adultos_proph_arima.rtf"))
+tta_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "3.14.tentativa_adultos_proph_arima.tex"))
+```  
+  
+###### Gráficos de pronóstico
+  
+```{r}
+cowplot::plot_grid(sui_adultos_pron$arima_plot, 
+                  sui_adultos_prophet_plot, 
+                  labels = c('Arima', 'Prophet'))
+
+library(cowplot)
+tta_plots_aligned  <- align_plots(sui_adultos_pron$arima_plot + theme(legend.position = "none")  + ggtitle('ARIMA (0,0,5)(0,0,1)[12]'), 
+                     sui_adultos_prophet_plot + theme(legend.position = "none")  + ggtitle('Prophet'),
+                     align = 'v', 
+                     axis = 'l')
+
+tta_arima_legend <- get_legend(sui_adultos_pron$arima_plot)
+
+(tta_final_plot <- cowplot::plot_grid(tta_plots_aligned[[1]], 
+                   tta_plots_aligned[[2]], 
+                  tta_arima_legend, 
+                  label_size = 10,
+                  rel_heights =  c(1, 1, .1),
+                  nrow = 3))
+
+png(filename = file.path(img_folder, "3.18.tentativa_suicidio_pron_final.png"),
+    width = 720, height = 520, units = "px")
+tta_final_plot
+dev.off()
+```    
+  
+##### 2018  
+  
+```{r}
+# sui_adultos_prophet_mod18 <- generate_prophet_forecast(sui_adultos_train18,
+#                                               sui_adultos_test18,
+#                                               periods = 12*5)
+# 
+# write_rds(sui_adultos_prophet_mod18, "modelos/sui_adultos_prophet18.RDS")
+sui_adultos_prophet18 <- readRDS("modelos/sui_adultos_prophet18.RDS")
+
+sui_adultos_prophet18$acc_consolidated %>%
+  mutate(model = 1:nrow(sui_adultos_prophet18$acc_consolidated)) %>% 
+  arrange(RMSE, MAPE)
+
+sui_adultos_sel_prophet18 <- 52
+sui_adultos_prophet_mod18 <- sui_adultos_prophet18$forecast_tb_list[[sui_adultos_sel_prophet18]] %>% 
+  left_join(sui_adultos_test18 %>% mutate(TIEMPO = as_date(TIEMPO)), by = c("ds" = "TIEMPO")) %>% 
+  mutate(
+    year = year(ds),
+    in_out = case_when(
+      TOTAL <= yhat_upper & TOTAL >= yhat_lower ~ "In",
+      TRUE ~ "Out"
+    )
+  ) %>% 
+  group_by(year) %>% 
+  mutate(
+    prop_in = sum(in_out == "In")/n(),
+    label = "2018 and up"
+  )
+sui_adultos_prophet_plot18 <- generate_prophet_plot(sui_adultos_train18, 
+                      sui_adultos_test18, 
+                      forecast_tb = sui_adultos_prophet_mod18)
+
+sui_adultos_prophet_plot18
+```    
+  
+##### 2019  
+  
+```{r}
+# sui_adultos_prophet_mod19 <- generate_prophet_forecast(sui_adultos_train19,
+#                                               sui_adultos_test19,
+#                                               periods = 12*4)
+# 
+# write_rds(sui_adultos_prophet_mod19, "modelos/sui_adultos_prophet19.RDS")
+sui_adultos_prophet19 <- readRDS("modelos/sui_adultos_prophet19.RDS")
+
+sui_adultos_prophet19$acc_consolidated %>%
+  mutate(model = 1:nrow(sui_adultos_prophet19$acc_consolidated)) %>% 
+  arrange(RMSE, MAPE)
+
+sui_adultos_sel_prophet19 <- 36
+sui_adultos_prophet_mod19 <- sui_adultos_prophet19$forecast_tb_list[[sui_adultos_sel_prophet19]] %>% 
+  left_join(sui_adultos_test19 %>% mutate(TIEMPO = as_date(TIEMPO)), by = c("ds" = "TIEMPO")) %>% 
+  mutate(
+    year = year(ds),
+    in_out = case_when(
+      TOTAL <= yhat_upper & TOTAL >= yhat_lower ~ "In",
+      TRUE ~ "Out"
+    )
+  ) %>% 
+  group_by(year) %>% 
+  mutate(
+    prop_in = sum(in_out == "In")/n(),
+    label = "2019 and up"
+  )
+sui_adultos_prophet_plot19 <- generate_prophet_plot(sui_adultos_train19, 
+                      sui_adultos_test19, 
+                      forecast_tb = sui_adultos_prophet_mod19)
+
+sui_adultos_prophet_plot19
+```        
+  
+#### Models Proportion IC   
+  
+```{r}
+sui_adultos_mods_ic <-  bind_rows(sui_adultos_prophet_mod18, sui_adultos_prophet_mod19, sui_adultos_prophet_mod) %>% 
+  select(label, year, prop_in) %>% distinct() %>% 
+  pivot_wider(
+    names_from = year,
+    values_from = prop_in
+  )
+sui_adultos_mods_ic
+```
+  
+  
+```{r}
+tta_supuesto_resi <- summary_arima_mods %>% 
+  gt::gt()
+
+tta_supuesto_resi %>% 
+  gt::gtsave(file.path(tab_folder, "3.15.tentativa_adultos_arima_sups.rtf"))
+tta_supuesto_resi %>% 
+  gt::gtsave(file.path(tab_folder, "3.15.tentativa_adultos_arima_sups.tex"))
+```  

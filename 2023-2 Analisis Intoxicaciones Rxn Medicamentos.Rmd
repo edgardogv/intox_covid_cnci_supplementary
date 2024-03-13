@@ -1,0 +1,1780 @@
+---
+title: "Análisis de Intoxicaciones Reportadas por Reacciones adversas a medicamentos, errores y automedicación"
+author: "Edgardo Gutiérrez Vega"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    downcute_theme: "chaos"
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 99)
+read_folder <- "datos_procesados"
+save_graficos <- "resultados_graficos"
+causa_ref <- "Reacción adversa a medicamentos, Errores y Automedicación"
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(gtsummary)
+library(sf)
+library(FactoMineR)
+library(factoextra)
+source("R/tibl_to_ts.R")
+source("R/ggplot_ts.R")
+source("R/plot_map.R")
+source("R/get_ts_from_agg_df.R")
+source("R/get_arima_model.R")
+source("R/get_change_points.R")
+source("R/generate_counts.R")
+source("R/generate_counts_v2.R")
+source("R/generate_dtw_cluster_plot.R")
+source("R/analisis_correspondencia.R")
+source("R/get_cumulative_frequencies.R")
+source("R/generate_prophet_forecast.R")
+source("R/gg_arma_spanish.R")
+source("R/gg_tsresiduals_spanish.R")
+source("R/gg_tsdisplay_spanish.R")
+library(fable)
+library(feasts)
+img_folder <- "0.documento_final/img_finales/2.Rxn_meds"
+tab_folder <- "0.documento_final/tab_finales/2.Rxn_meds"
+intox_rxad <- read_rds(file.path(read_folder, "intox_reacciones.RDS"))
+pob_year_sexo_ge_canton <- read_rds(file.path(read_folder, "pob_data.RDS"))
+meds <- read_rds(file.path(read_folder, "meds.RDS"))
+cantones_st <- read_rds(file.path(read_folder, "cantones_st.RDS"))
+table_count <- 1
+summary_arima_mods <- tibble()
+```
+
+## Procesamiento de datos de reacción adversa  
+  
+En el caso de las intoxicaciones por reacciones adversas a medicamentos, errores y automedicación, el Cuadro  `r table_count` que los grupos principales de interes con los que se reporta este tipo de intoxicaciones son los medicamentos para el dolor, los antibióticos, analgésicos narcóticos, Antihistaminicos, antiemeticos, antipruriticos, y los Sedantes/hipnoticos, ansioliticos, todos con un total superior a 1 mil casos en el período de 2015 a 2022, para un total aproximado de 66% de los casos reportados como causa accidental. Los análisis posteriores se enfocan en estos grupos.  
+  
+```{r}
+intox_rxad$TOXICO_INTERES1 %>% table %>% prop.table() %>% sort
+
+intox_rxad_freq_table <- get_cumulative_frequencies(intox_rxad, "TOXICO_INTERES1")
+
+table_count <- table_count + 1
+
+intox_rxad_freq_table %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+```
+  
+Al visualizar más en detalle la categoría "Otros" en los tóxicos de interés, como era de esperar la variedad a nivel de tóxico principal sugiere que estos tóxicos pueden agruparse en la categoría de "Otros Medicamentos".     
+
+```{r}
+otros_rxad_df <- intox_rxad %>% 
+  filter(TOXICO_INTERES1 == "Otros")
+
+intox_rxad_otros_table <- get_cumulative_frequencies(otros_rxad_df, "TOXICO1")
+
+table_count <- table_count + 1
+
+intox_rxad_otros_table %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+```  
+  
+Al visualizarlos a nivel de código de tóxico, efectivamente el 99% de los casos son medicamentos, por lo que se incluirá este nivel dentro de los tóxicos de interés.  
+
+```{r}
+intox_rxad_otros_codtox <- get_cumulative_frequencies(otros_rxad_df, "CODTOX1")
+
+table_count <- table_count + 1
+
+intox_rxad_otros_codtox %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+```    
+  
+Al realizar este cambio, la categoria "Otros medicamentos"se convierte en el principal grupo de interés, seguido por los medicamentos para el dolor. Por la naturaleza de la causa, Se excluyeron los tóxicos de interés que no son medicamentos quedando un 98% de los datos para el análisis.  
+
+```{r}
+intox_rxad <- intox_rxad %>% 
+  mutate(
+    TOXICO_INTERES1_BACKUP = TOXICO_INTERES1,
+    TOXICO_INTERES1 = case_when(
+      CODTOX1 == "01.Medicamentos" & TOXICO_INTERES1 == "Otros" ~ "Otros Medicamentos",
+      TRUE ~ TOXICO_INTERES1
+    )
+  ) 
+
+rxad_cum_freqs <- get_cumulative_frequencies(intox_rxad, "TOXICO_INTERES1") %>% 
+  mutate(
+    TOXICO_INTERES1 = case_when(
+      TOX_FREQ < 1 ~ "Otros",
+      TRUE ~ TOXICO_INTERES1
+    )
+    # TOXICO_INTERES1 = str_to_title(TOXICO_INTERES1)
+  ) 
+
+(rxad_sel_toxicos <- rxad_cum_freqs %>% 
+  group_by(TOXICO_INTERES1) %>% 
+  summarise(
+    TOX_N = sum(TOX_N),
+    TOX_FREQ = sum(TOX_FREQ)
+  ) %>%
+  arrange(desc(TOX_FREQ)) %>% 
+  arrange(TOXICO_INTERES1 == "Otros") %>% 
+  mutate(TOX_FREQ_CUMSUM = cumsum(TOX_FREQ)) %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  rename(
+    `Tipo de Tóxico Principal` = TOXICO_INTERES1,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+rxad_sel_toxicos %>% 
+  gt::gtsave(file.path(tab_folder, "2.1.Rxns.rtf"))
+rxad_sel_toxicos %>% 
+  gt::gtsave(file.path(tab_folder, "2.1.Rxns.tex"))
+
+intox_rxad <- intox_rxad %>% 
+  mutate(
+    TOXICO_INTERES1 = case_when(
+      !TOXICO_INTERES1 %in% rxad_cum_freqs$TOXICO_INTERES1 ~ "Otros",
+      TRUE ~ TOXICO_INTERES1
+    )
+  ) %>% 
+  filter(TOXICO_INTERES1 != "Otros")
+
+table_count <- table_count + 1
+
+(rxad_sel_toxicos <- get_cumulative_frequencies(intox_rxad, "TOXICO1") %>% 
+  mutate(
+    TOXICO1 = case_when(
+      TOX_FREQ < 1 ~ "Otros",
+      TRUE ~ TOXICO1
+    ),
+    TOXICO1 = str_to_title(TOXICO1)
+  ) %>% 
+  group_by(TOXICO1) %>% 
+  summarise(
+    TOX_N = sum(TOX_N),
+    TOX_FREQ = sum(TOX_FREQ)
+  ) %>%
+  arrange(desc(TOX_FREQ)) %>% 
+  arrange(TOXICO1 == "Otros") %>% 
+  mutate(TOX_FREQ_CUMSUM = cumsum(TOX_FREQ)) %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  rename(
+    `Tóxico Principal` = TOXICO1,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+rxad_sel_toxicos %>% 
+  gt::gtsave(file.path(tab_folder, "2.2.Rxns.rtf"))
+rxad_sel_toxicos %>% 
+  gt::gtsave(file.path(tab_folder, "2.2.Rxns.tex"))
+```
+  
+El análisis de agrupamiento de las diferentes series de tiempo para los tóxicos de interés solo muestra un comportamiento claramente diferenciado para los biológicos, vacunas y toxoides. Para los demás medicaamentos, no se apreció ningún cambio especialmente notable después del inicio de la pandemia, sin embargo, se procedió a integrar los medicamentos para el dolor, analgésicos narcóticos y antibióticos en un único grupo, mantieniendo los biológicos, vacunas y toxoides separados, y combinando los demás con el grupo "otros medicamentos". Por la naturaleza de la causa, se omitieron otros tóxicos de interés.  
+  
+```{r fig.width=10, fig.height=15}
+agg_intox_rxad_toxs_std <- generate_counts2(
+  intox_rxad, 
+  date_column = "TIEMPO",
+  grouping_variables = c("TOXICO_INTERES1"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_rxad_toxs <- generate_counts2(
+  intox_rxad, 
+  date_column = "TIEMPO",
+  grouping_variables =  c("TOXICO_INTERES1"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+png(filename = file.path(img_folder, "1.1.Rxns_std.png"),
+    width = 820, height = 700, units = "px")
+generate_dtw_cluster_plot(agg_intox_rxad_toxs_std, k_clusters = 4, lab_y = "Totales Estandarizados")
+dev.off()
+png(filename = file.path(img_folder, "1.2.Rxns_original.png"),
+    width = 920, height = 700, units = "px")
+generate_dtw_cluster_plot(agg_intox_rxad_toxs, k_clusters = 4, lab_y = "Total de Casos Reportados")  
+dev.off()
+```       
+  
+Al realizar este cambio, el grupo de otros medicamentos representó casi el 60% de los datos, seguido por un 37% del grupo de antibioticos y medicamentos para el dolor.  
+
+```{r}
+intox_rxad <- intox_rxad %>% 
+  mutate(
+    TOXICO_INTERES1_BACKUP = TOXICO_INTERES1,
+    TOXICO_INTERES1 = case_when(
+      TOXICO_INTERES1 %in% c("Analgesicos Narcoticos", 
+                             "Medicamentos para el dolor",
+                             "Antibioticos") ~ "Antibióticos y Medicamentos para el dolor",
+      TOXICO_INTERES1 %in% c("Biologicos, vacunas, toxoides y antitoxinas") ~ "Biologicos, vacunas, toxoides y antitoxinas",
+      TRUE ~ "Otros Medicamentos"
+    )
+  )
+
+intox_rxad_freq_table <- get_cumulative_frequencies(intox_rxad, "TOXICO_INTERES1")
+
+table_count <- table_count + 1
+
+intox_rxad_freq_table %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+```  
+  
+```{r fig.width=10, fig.height=15}
+agg_intox_rxad_toxs <- generate_counts2(
+  intox_rxad, 
+  date_column = "TIEMPO",
+  grouping_variables = c("TOXICO_INTERES1")) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_rxad_toxs, k_clusters = 2)
+```  
+  
+Considerando este comportamiento, y por indicación de la lectora del centro, se procedió a combinar todos los medicamentos bajo un solo grupo, a excepción de los biológicos y vacunas, debido al comportamiento diferenciado que tienen estos últimos.
+
+```{r}
+intox_rxad <- intox_rxad %>% 
+  mutate(
+    TOXICO_INTERES1 = case_when(
+      TOXICO_INTERES1 %in% c("Biologicos, vacunas, toxoides y antitoxinas") ~ "Biologicos, vacunas, toxoides y antitoxinas",
+      TRUE ~ "Medicamentos"
+    )
+  )
+
+intox_rxad_freq_table <- get_cumulative_frequencies(intox_rxad, "TOXICO_INTERES1")
+
+table_count <- table_count + 1
+
+intox_rxad_freq_table %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+
+agg_intox_rxad_toxs <- generate_counts2(
+  intox_rxad, 
+  date_column = "TIEMPO",
+  grouping_variables = c("TOXICO_INTERES1")) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+``` 
+  
+Tomando en consideración que los biológicos y vacunas representaron solo un 5% de los tóxicos correspondientes a esta causa, no se procedió a realizar el análisis de series de tiempo y de segmentación demográfica, sin embargo, se realizó un análisis descriptivo para entender a qué tóxicos estuvo relacionado el incremento de casos a mediados de año en el 2020, 2021 y 2022. Los datos mostraron que la gran mayoría de casos corresponden a reportes por la vacuna contra la influenza. En 2021 y 2022, más del 50% de los casos correspondieron a niños menores a 10 años, seguidos por adultos mayores a 55 años.
+  
+```{r}
+rxad_vacunas <- intox_rxad %>% 
+  filter(TOXICO_INTERES1 == "Biologicos, vacunas, toxoides y antitoxinas")
+
+agg_intox_rxad_vacunas <- generate_counts2(
+  rxad_vacunas, 
+  date_column = "TIEMPO",
+  grouping_variables = c("TOXICO_INTERES1")) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+vacunas_top_dates <- agg_intox_rxad_vacunas %>% 
+  filter(
+    TOTAL >= quantile(TOTAL, 0.95)
+  ) 
+
+(vacunas_top_dates_gt <- vacunas_top_dates %>% 
+  select(-TOXICO_INTERES1, -YEAR) %>%
+  mutate(
+    TIEMPO = as.character(TIEMPO)
+  ) %>% 
+  gt::gt())
+
+vacunas_top_dates_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.3.Rxns.rtf"))
+vacunas_top_dates_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.3.Rxns.tex"))
+
+rxad_vacunas_fltd <- rxad_vacunas %>% 
+  filter(TIEMPO %in% vacunas_top_dates$TIEMPO)
+
+(rxa_vacunas_cumulative <- get_cumulative_frequencies(rxad_vacunas, "TOXICO1") %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  rename(
+    `Tóxico Principal` = TOXICO1,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+get_cumulative_frequencies(rxad_vacunas_fltd, "TOXICO1") %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+
+(rxad_vacunas_demograf <- rxad_vacunas %>%
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      EDAD_A < 12 ~ "Edad menor a 12 años",
+      EDAD_A >= 12 ~ "Edad 12 años o mayor"
+    ),
+    TOXICO1 = str_to_title(TOXICO1)
+  ) %>% 
+  select(YEAR, SEXO, GRUPO_ETARIO2, TOXICO1) %>% 
+       tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(TOXICO1 ~ "Tóxico Principal",
+                     SEXO ~ "Sexo",
+                     GRUPO_ETARIO2 ~ "Grupo Etario"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**"))
+
+rxad_vacunas_demograf %>% 
+  gtsummary::as_gt() %>% 
+  gt::gtsave(file.path(tab_folder, "2.4.Rxns.rtf"))
+rxad_vacunas_demograf %>% 
+  gtsummary::as_gt() %>% 
+  gt::gtsave(file.path(tab_folder, "2.4.Rxns.tex"))
+
+```
+  
+El Cuadro `r table_count` presenta los conteos por año según sexo y grupo etario. Se observó que existe una tendencia a que las mujeres reportan más del 62% de estas causas en el período evaluado, hasta llegar a superar al género masculino por casi el doble de casos reportados en 2020, 2021 y 2022. Respecto al grupo etario, Por lo general el grupo etario con edades entre los 0 y 4 años fue el que englobó alrededor del 16% de los reportes por intoxicaciones relacionadas a reacciones adversas a medicamentos a lo largo de todos los años seguidos por el grupo de 30 a 34 años. Tomando en cuenta estas frecuencias, se procedió a generar grupos etarios más generales para las otras edades.   
+  
+```{r}
+intox_rxad <- intox_rxad %>% 
+  filter(TOXICO_INTERES1 == "Medicamentos")
+
+agg_intox_rxad_toxs <- agg_intox_rxad_toxs %>% 
+  filter(TOXICO_INTERES1 == "Medicamentos")
+
+intox_rxad_fltd <- intox_rxad_freq_table %>% 
+  right_join(intox_rxad) 
+
+table_count <- table_count + 1
+
+intox_rxad_fltd %>%
+  select(YEAR, SEXO, GRUPO_ETARIO, TOXICO_INTERES1) %>% 
+       tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(TOXICO_INTERES1 ~ "Toxico de Interés"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**")
+```
+  
+El Cuadro `r table_count` presenta las proporciones actualizadas por año según los nuevos grupos etarios. Con este arreglo, los grupos principales son el de mayor a 65 año, seguido muy de cerca por el de 24 a 34 años y 0 a 4 años.  
+  
+```{r}
+intox_rxad_fltd <- intox_rxad_fltd %>% 
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      GRUPO_ETARIO %in% c("05 a 9 años", "10 a 14 años") ~ "05 a 14 años",
+      GRUPO_ETARIO %in% c("15 a 19 años", "20 a 24 años") ~ "15 a 24 años",
+      GRUPO_ETARIO %in% c("25 a 29 años", "30 a 34 años") ~ "25 a 34 años",
+      GRUPO_ETARIO %in% c("35 a 39 años", "40 a 44 años") ~ "35 a 44 años",
+      GRUPO_ETARIO %in% c("45 a 49 años", "50 a 54 años") ~ "45 a 54 años",
+      GRUPO_ETARIO %in% c("55 a 59 años", "60 a 64 años") ~ "55 a 64 años",
+      GRUPO_ETARIO %in% c("65 a 69 años", "70 a 74 años", "Mayor a 75 años") ~ "Mayor a 65 años",
+      TRUE ~ GRUPO_ETARIO
+    )
+  )
+
+table_count <- table_count + 1
+
+(rxad_meds_demograf <- intox_rxad_fltd %>%
+  select(YEAR, SEXO, GRUPO_ETARIO2) %>% 
+       tbl_summary(
+        by = YEAR,
+        # sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(GRUPO_ETARIO2 ~ "Grupo Etario",
+                     SEXO ~ "Sexo"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**"))
+  
+rxad_meds_demograf %>% 
+  gtsummary::as_gt() %>% 
+  gt::gtsave(file.path(tab_folder, "2.5.Rxns.rtf"))
+rxad_meds_demograf %>% 
+  gtsummary::as_gt() %>% 
+  gt::gtsave(file.path(tab_folder, "2.5.Rxns.tex"))
+```
+  
+El Cuadro `r table_count` presenta el detalle de los tóxicos específicos relacionados con los reportes de intoxicación por adversa a medicamentos, errores y automedicación, siendo tramadol, clonazepam, acetaminofen y amoxicilina los principales tóxicos reportados con más de 30% de los casos totales en todo el período analizado, seguidos por medicamentos desconocidos.  
+  
+```{r}
+table_count <- table_count + 1
+
+get_cumulative_frequencies(intox_rxad_fltd, "TOXICO1") %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+```
+  
+## Dynamic Time Warping Clustering - Reacciones adversas  
+  
+https://damien-datasci-blog.netlify.app/post/time-series-clustering-with-dynamic-time-warp/  
+  
+### DTW - Medicamentoss   
+  
+Se encontro que los grupos etarios que posiblemente hacen más sentido son menores a 15 años y mayores a 15 años.  
+  
+```{r fig.width=10, fig.height=15}
+agg_intox_rxad_toxs <- generate_counts2(
+  intox_rxad_fltd, 
+  date_column = "TIEMPO",
+  grouping_variables = c("GRUPO_ETARIO2", "SEXO", "TOXICO_INTERES1"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_rxad_toxs_std <- generate_counts2(
+  intox_rxad_fltd, 
+  date_column = "TIEMPO",
+  grouping_variables = c("GRUPO_ETARIO2", "SEXO", "TOXICO_INTERES1"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_rxad_toxs, k_clusters = 2)
+generate_dtw_cluster_plot(agg_intox_rxad_toxs_std, k_clusters = 2)
+
+png(filename = file.path(img_folder, "1.3.Rxns_std.png"),
+    width = 820, height = 700, units = "px")
+generate_dtw_cluster_plot(agg_intox_rxad_toxs_std, k_clusters = 2, lab_y = "Totales Estandarizados")
+dev.off()
+png(filename = file.path(img_folder, "1.4.Rxns_original.png"),
+    width = 920, height = 700, units = "px")
+generate_dtw_cluster_plot(agg_intox_rxad_toxs, k_clusters = 2, lab_y = "Total de Casos Reportados")  
+dev.off()
+```      
+  
+La nueva agrupación muestra que se debe analizar los menores a 15 años juntos, y mantener una separación entre hombres y mujeres para los mayores a 15 años.  
+  
+```{r fig.width=10, fig.height=15}
+agg_intox_rxd <- agg_intox_rxad_toxs %>%
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      GRUPO_ETARIO2 %in% c("0 a 4 años", "5 a 14 años") ~ "Menor a 15 años",
+      !GRUPO_ETARIO2 %in% c("0 a 4 años", "5 a 14 años") ~ "Mayor a 15 años"
+    )
+  ) 
+
+agg_intox_rxd_std <- agg_intox_rxad_toxs_std %>%
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      GRUPO_ETARIO2 %in% c("0 a 4 años", "5 a 14 años") ~ "Menor a 15 años",
+      !GRUPO_ETARIO2 %in% c("0 a 4 años", "5 a 14 años") ~ "Mayor a 15 años"
+    )
+  ) 
+
+# si hay separación
+generate_dtw_cluster_plot(agg_intox_rxd, k_clusters = 2)
+generate_dtw_cluster_plot(agg_intox_rxd_std, k_clusters = 2)
+```     
+  
+```{r}
+rx_men15_data <- intox_rxad_fltd %>% 
+  filter(EDAD_A < 15)
+
+(rx_men15_data %>%
+  select(YEAR, TOXICO1) %>% 
+  tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(TOXICO1 = "Tóxico Principal"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**"))
+```  
+
+```{r}
+may15_rx_data <- intox_rxad_fltd %>% 
+  filter(EDAD_A >= 15)
+
+(may15_rx_data %>%
+  select(YEAR, TOXICO1) %>% 
+  tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(TOXICO1 = "Tóxico Principal"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**"))
+```  
+  
+  
+## Reacciones adversas - Menores a 15 años  
+  
+```{r} 
+rxad_men15 <- get_ts_from_agg_df(agg_intox_rxd, 
+                                 filtro_etario = "Menor a 15 años")
+
+(rx_men15_prop <- sum(rxad_men15$ts_full)/nrow(intox_rxad))
+
+rxad_men15_tsibble <- rxad_men15$agg_data %>% 
+  as_tsibble(index = TIEMPO) %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO))
+
+rxad_men15_train <- rxad_men15_tsibble %>% 
+  filter(TIEMPO < tsibble::yearmonth("2020-03"))
+rxad_men15_test <- rxad_men15_tsibble %>% 
+  filter(TIEMPO >= tsibble::yearmonth("2020-03"))
+```
+
+### Changepoint - Enfoque cambio de nivel
+
+```{r}
+rxad_men15_cpts <- get_change_points(rxad_men15$ts_full)
+rxad_men15_cpts$cp_plot
+```
+  
+### ARIMA - Enfoque Intervencion  
+  
+#### Estacionariedad y Autocorrelogramas Intervención   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+# DescTools::PlotACF(rxad_men15$ts_full, main = "")
+
+rxad_men15_tsibble %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+rxad_men15_tsibble |>
+  features(TOTAL, unitroot_nsdiffs)
+
+rxad_men15_tsibble |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+rxad_men15_tsibble |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+rxad_men15_tsibble |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+rxad_men15_tsibble |>
+  gg_tsdisplay(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+png(filename = file.path(img_folder, "1.5..Rxns_int.png"),
+    width = 720, height = 480, units = "px")
+rxad_men15_tsibble |>
+  gg_tsdisplay_spanish(TOTAL,
+               plot_type='partial', lag=36)  +
+  ylab("Total de Casos Reportados")
+dev.off()
+```  
+  
+#### Modelaje Intervención  
+  
+##### Selección del Modelo  
+  
+```{r}
+inter <- c(rep(0, 62), rep(1, 34))
+timeperiod <- 96
+
+# rxad_men15_inter_model <- rxad_men15_tsibble %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE))
+
+rxad_men15_inter_model <- rxad_men15_tsibble %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_301_auto = ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE),
+    arima_000 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,0,0) + inter),
+    arima_001 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,0,0) + inter),
+    arima_100 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,0,0) + inter),
+    arima_101 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,0,0) + inter),
+    arima_002 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(0,0,0) + inter),
+    arima_200 = ARIMA(TOTAL ~ pdq(2,0,0) + PDQ(0,0,0) + inter),
+    arima_102 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(0,0,0) + inter),
+    arima_201 = ARIMA(TOTAL ~ pdq(2,0,1) + PDQ(0,0,0) + inter),
+    arima_202 = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(0,0,0) + inter),
+    
+    arima_003 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(0,0,0) + inter),
+    arima_300 = ARIMA(TOTAL ~ pdq(3,0,0) + PDQ(0,0,0) + inter),
+    arima_103 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(0,0,0) + inter),
+    arima_301 = ARIMA(TOTAL ~ pdq(3,0,1) + PDQ(0,0,0) + inter),
+    arima_302 = ARIMA(TOTAL ~ pdq(3,0,2) + PDQ(0,0,0) + inter),
+    arima_203 = ARIMA(TOTAL ~ pdq(2,0,3) + PDQ(0,0,0) + inter),
+    arima_303 = ARIMA(TOTAL ~ pdq(3,0,3) + PDQ(0,0,0) + inter),
+    
+    arima_004 = ARIMA(TOTAL ~ pdq(0,0,4) + PDQ(0,0,0) + inter),
+    arima_400 = ARIMA(TOTAL ~ pdq(4,0,0) + PDQ(0,0,0) + inter),
+    arima_104 = ARIMA(TOTAL ~ pdq(1,0,4) + PDQ(0,0,0) + inter),
+    arima_401 = ARIMA(TOTAL ~ pdq(4,0,1) + PDQ(0,0,0) + inter),
+    arima_402 = ARIMA(TOTAL ~ pdq(4,0,2) + PDQ(0,0,0) + inter),
+    arima_204 = ARIMA(TOTAL ~ pdq(2,0,4) + PDQ(0,0,0) + inter),
+    arima_304 = ARIMA(TOTAL ~ pdq(3,0,4) + PDQ(0,0,0) + inter),
+    arima_403 = ARIMA(TOTAL ~ pdq(4,0,3) + PDQ(0,0,0) + inter),
+    arima_404 = ARIMA(TOTAL ~ pdq(4,0,4) + PDQ(0,0,0) + inter),
+    
+    arima_005 = ARIMA(TOTAL ~ pdq(0,0,5) + PDQ(0,0,0) + inter),
+    arima_500 = ARIMA(TOTAL ~ pdq(5,0,0) + PDQ(0,0,0) + inter),
+    arima_105 = ARIMA(TOTAL ~ pdq(1,0,5) + PDQ(0,0,0) + inter),
+    arima_501 = ARIMA(TOTAL ~ pdq(5,0,1) + PDQ(0,0,0) + inter),
+    arima_502 = ARIMA(TOTAL ~ pdq(5,0,2) + PDQ(0,0,0) + inter),
+    arima_205 = ARIMA(TOTAL ~ pdq(2,0,5) + PDQ(0,0,0) + inter),
+    arima_305 = ARIMA(TOTAL ~ pdq(3,0,5) + PDQ(0,0,0) + inter),
+    arima_503 = ARIMA(TOTAL ~ pdq(5,0,3) + PDQ(0,0,0) + inter),
+    arima_405 = ARIMA(TOTAL ~ pdq(4,0,5) + PDQ(0,0,0) + inter),
+    arima_504 = ARIMA(TOTAL ~ pdq(5,0,4) + PDQ(0,0,0) + inter),
+    arima_505 = ARIMA(TOTAL ~ pdq(5,0,5) + PDQ(0,0,0) + inter)
+  )
+
+rxad_men15_inter_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(rxad_men15_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(rx_men15_arima_table <- glance(rxad_men15_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ) %>% 
+  filter(!str_detect(Modelo, "auto")))
+  # arrange(!str_detect(Modelo, "500")))
+
+rx_men15_arima_int_gt <- rx_men15_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+rx_men15_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.6.Rxns_men15_arima_int.rtf"))
+rx_men15_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.6.Rxns_men15_arima_int.tex"))
+
+rxad_men15_inter_sel_model <- rxad_men15_inter_model |>
+  select(arima_000)
+
+rxad_men15_inter_sel_model |>
+  report()
+
+rx_men15_arima_gt <- rxad_men15_inter_sel_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "inter" ~ "Intervención",
+      term == "intercept" ~ "Intercepto",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+rx_men15_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.7.Rx_men15_arima_int_mod.rtf"))
+rx_men15_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.7.Rx_men15_arima_int_mod.tex"))
+
+rxad_men15_inter_sel_model |> 
+  gg_tsresiduals(lag=timeperiod)
+
+png(filename = file.path(img_folder, "2.6.Rx_men15_int_resids.png"),
+    width = 720, height = 480, units = "px")
+rxad_men15_inter_sel_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+```
+  
+##### Verificación de Supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(rxad_men15_inter_lb <- augment(rxad_men15_inter_model) |>
+  filter(.model == "arima_000") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 0))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+  
+###### Raíces Unitarias  
+  No aplica porque es 000.
+```{r}
+# rxad_men15_inter_sel_model |> 
+#   gg_arma()
+# 
+# png(filename = file.path(img_folder, "2.6.Rx_men15_int_roots.png"),
+#     width = 720, height = 480, units = "px")
+# rxad_men15_inter_sel_model |> 
+#   gg_arma_spanish()
+# dev.off()
+```
+  
+###### Normalidad de los residuos  
+  
+```{r}
+# Normalidad de Residuos - ARIMA
+rxad_men15_inter_ts_residuals <- residuals(rxad_men15_inter_sel_model, 
+                                    type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(rxad_men15_inter_ts_residuals)
+
+(rxad_men15_inter_jb_arima <- tseries::jarque.bera.test(rxad_men15_inter_ts_residuals))
+
+(rxad_men15_inter_shap_arima <-shapiro.test(rxad_men15_inter_ts_residuals))
+
+car::qqPlot(rxad_men15_inter_ts_residuals)
+
+# Normalidad de residuos - Regresion
+rxad_men15_inter_reg_residuals <- residuals(rxad_men15_inter_sel_model, type = "regression") %>% as_tibble() %>% pull(.resid)
+
+mean(rxad_men15_inter_reg_residuals)
+
+(rxad_men15_inter_shap_reg <- shapiro.test(rxad_men15_inter_reg_residuals))
+
+car::qqPlot(rxad_men15_inter_reg_residuals)
+
+# Visualizacion ambos graficos
+bind_rows(
+    `Regression residuals` =
+        as_tibble(residuals(rxad_men15_inter_sel_model, type = "regression")),
+    `ARIMA residuals` =
+        as_tibble(residuals(rxad_men15_inter_sel_model, type = "innovation")),
+    .id = "type"
+  ) |>
+  mutate(
+    TIEMPO = as_date(TIEMPO)
+  ) |>
+  ggplot(aes(x = TIEMPO, y = .resid)) +
+  geom_line() +
+  facet_grid(vars(type))
+```
+  
+##### Agrupación de resultados  
+  
+```{r}
+(summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Reacciones a Medicamentos",
+    Población = "Menores de 15 años",
+    Enfoque = "Intervención",
+    Modelo = "Regresion con ARIMA (0,0,0)",
+    # Significancia_intervencion = "No",
+    # ACF_Residuales = "Todos dentro",
+    # Histograma = "Aproximadamente Normal con un par de valores extremos",
+    Residuals_LJung_Box_Test_ARIMA = round(rxad_men15_inter_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(rxad_men15_inter_jb_arima$p.value, 2),
+    # Residuals_Shapiro_Test_ARIMA = round(rxad_men15_inter_shap_arima$p.value, 2),
+    Residuals_Shapiro_Wilk_Regression = round(rxad_men15_inter_shap_reg$p.value, 2)
+  )))
+```
+  
+#### ARIMA - Enfoque Pronostico  
+  
+#### Estacionariedad y Autocorrelogramas Pronóstico   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+rxad_men15_train %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+rxad_men15_train |>
+  features(TOTAL, unitroot_nsdiffs)
+
+rxad_men15_train |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+rxad_men15_train |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+rxad_men15_train |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+rxad_men15_train |>
+  gg_tsdisplay(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+png(filename = file.path(img_folder, "2.7..Rxns_pron_dif.png"),
+    width = 720, height = 480, units = "px")
+rxad_men15_train |>
+  gg_tsdisplay_spanish(TOTAL,
+               plot_type='partial', lag=36) +
+  ylab("Total de Casos")
+dev.off()
+```    
+  
+#### Modelaje Pronóstico     
+  
+##### Selección del Modelo  
+  
+```{r}
+# rxad_men15_pron_model <- rxad_men15_train %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE))
+# 
+# rxad_men15_pron_model |>
+#   pivot_longer(everything(),
+#                names_to = "Model name",
+#                values_to = "Orders")
+
+rxad_men15_pron_model <- rxad_men15_train %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_401_auto = ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE),
+    arima_000 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,0,0)),
+    arima_001 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,0,0)),
+    arima_100 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,0,0)),
+    arima_101 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,0,0)),
+    arima_002 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(0,0,0)),
+    arima_200 = ARIMA(TOTAL ~ pdq(2,0,0) + PDQ(0,0,0)),
+    arima_102 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(0,0,0)),
+    arima_201 = ARIMA(TOTAL ~ pdq(2,0,1) + PDQ(0,0,0)),
+    arima_202 = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(0,0,0)),
+    
+    arima_003 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(0,0,0)),
+    arima_300 = ARIMA(TOTAL ~ pdq(3,0,0) + PDQ(0,0,0)),
+    arima_103 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(0,0,0)),
+    arima_301 = ARIMA(TOTAL ~ pdq(3,0,1) + PDQ(0,0,0)),
+    arima_302 = ARIMA(TOTAL ~ pdq(3,0,2) + PDQ(0,0,0)),
+    arima_203 = ARIMA(TOTAL ~ pdq(2,0,3) + PDQ(0,0,0)),
+    arima_303 = ARIMA(TOTAL ~ pdq(3,0,3) + PDQ(0,0,0)),
+    
+    arima_004 = ARIMA(TOTAL ~ pdq(0,0,4) + PDQ(0,0,0)),
+    arima_400 = ARIMA(TOTAL ~ pdq(4,0,0) + PDQ(0,0,0)),
+    arima_104 = ARIMA(TOTAL ~ pdq(1,0,4) + PDQ(0,0,0)),
+    arima_401 = ARIMA(TOTAL ~ pdq(4,0,1) + PDQ(0,0,0)),
+    arima_402 = ARIMA(TOTAL ~ pdq(4,0,2) + PDQ(0,0,0)),
+    arima_204 = ARIMA(TOTAL ~ pdq(2,0,4) + PDQ(0,0,0)),
+    arima_304 = ARIMA(TOTAL ~ pdq(3,0,4) + PDQ(0,0,0)),
+    arima_403 = ARIMA(TOTAL ~ pdq(4,0,3) + PDQ(0,0,0)),
+    arima_404 = ARIMA(TOTAL ~ pdq(4,0,4) + PDQ(0,0,0)),
+  )
+
+rxad_men15_pron_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(rxad_men15_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(rx_men15_pron_arima_table <- glance(rxad_men15_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ))
+
+rx_men15_arima_pron_gt <- rx_men15_pron_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+rx_men15_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.8.Rx_men15_arima_pron.rtf"))
+rx_men15_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.8.Rx_men15_arima_pron.tex"))
+
+rxad_men15_final_arima_model <- rxad_men15_pron_model |>
+  select(arima_401) 
+
+rxad_men15_final_arima_model |>
+  report()
+
+rx_men15_arima_gt <- rxad_men15_final_arima_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "constant" ~ "Constante",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+rx_men15_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.9.Rx_men15_arima_pron_mod.rtf"))
+rx_men15_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.9.Rx_men15_arima_pron_mod.tex"))
+
+png(filename = file.path(img_folder, "2.9.Rx_men15_pron_resids.png"),
+    width = 720, height = 480, units = "px")
+rxad_men15_final_arima_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+
+rxad_men15_final_arima_model |> 
+  gg_tsresiduals(lag=timeperiod)
+```
+  
+##### Verificación de supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(rxad_men15_lb <-  augment(rxad_men15_pron_model) |>
+  filter(.model == "arima_401") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 5))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+   
+###### Raíces Unitarias
+   
+```{r}
+rxad_men15_final_arima_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "2.8.Rx_men15_pron_roots.png"),
+    width = 720, height = 480, units = "px")
+rxad_men15_final_arima_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+   
+###### Normalidad de los residuos   
+   
+```{r}
+# Normalidad de Residuos - ARIMA
+rxad_men15_residuals <- residuals(rxad_men15_final_arima_model, type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(rxad_men15_residuals)
+
+(rxad_men15_jb_arima <- tseries::jarque.bera.test(rxad_men15_residuals))
+
+(rxad_men15_shap_arima <- shapiro.test(rxad_men15_residuals))
+
+car::qqPlot(rxad_men15_residuals)
+```
+   
+##### Agrupación de Resultados   
+   
+```{r}
+rxad_men15_pron <- gen_pronostic_plot2(rxad_men15_train, 
+                                      rxad_men15_test,
+                                      rxad_men15_final_arima_model,
+                                      h_forecast = 34)
+
+rxad_men15_pron$pron_df <- rxad_men15_pron$pron_df %>% 
+  mutate(
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(rxad_men15_pron$pron_df$out)
+rxad_men15_pron$pron_df$ds[rxad_men15_pron$pron_df$out == 1]
+
+rxad_men15_arima_sel_df <- forecast::accuracy(rxad_men15_pron$pron_df$yhat,
+                                                    rxad_men15_pron$pron_df$y) %>%
+  as_tibble() %>% 
+  mutate(Modelo = "ARIMA (401)",
+         Metric_Type = "Test set")
+
+summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Reacciones a Medicamentos",
+    Población = "Menores de 15 años",
+    Enfoque = "Pronóstico",
+    Modelo = "ARIMA (401)",
+    # ACF_Residuales = "Todos dentro",
+    # Histograma = "Sesgado a la derecha con 2 valores extremos",
+    Residuals_LJung_Box_Test_ARIMA = round(rxad_men15_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(rxad_men15_jb_arima$p.value, 2),
+    # Residuals_Shapiro_Test_ARIMA = round(rxad_men15_shap_arima$p.value, 2)
+  ))
+```
+  
+#### Prophet - Enfoque Pronóstico
+  
+```{r}
+# rxad_men15_prophet_mod <- generate_prophet_forecast(rxad_men15_train,
+#                                               rxad_men15_test,
+#                                               periods = 34)
+# write_rds(rxad_men15_prophet_mod, "modelos/rxad_men15_prophet.RDS")
+rxad_men15_prophet <- readRDS("modelos/rxad_men15_prophet.RDS")
+
+rxad_men15_prophet$acc_consolidated %>%
+  mutate(model = 1:nrow(rxad_men15_prophet$acc_consolidated)) %>% 
+  arrange(RMSE, MAPE)
+
+rxad_men15_sel_prophet <- 36
+
+rx_men15_forecast_tb <- rxad_men15_prophet$forecast_tb_list[[rxad_men15_sel_prophet]] %>% 
+  mutate(
+    y = rxad_men15_pron$pron_df$y,
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(rx_men15_forecast_tb$out)
+rx_men15_forecast_tb$ds[rx_men15_forecast_tb$out == 1]
+
+rxad_men15_prophet_plot <- generate_prophet_plot(rxad_men15$ts_train, 
+                      rxad_men15$ts_test, 
+                      forecast_tb = rxad_men15_prophet$forecast_tb_list[[rxad_men15_sel_prophet]])
+
+combine_model_metrics2(rxad_men15_arima_sel_df, 
+                    rxad_men15_prophet$acc_consolidated[rxad_men15_sel_prophet,]) %>% 
+  arrange(RMSE, MAPE)
+
+(rx_men15_both_metrics <- combine_model_metrics2(rxad_men15_arima_sel_df, 
+                    rxad_men15_prophet$acc_consolidated[rxad_men15_sel_prophet,]) %>% 
+  arrange(RMSE, MAPE) %>% 
+    mutate_if(is.numeric, ~round(., 2)) %>% 
+    select(Modelo, RMSE, MAPE) %>% 
+  arrange(RMSE, MAPE))
+
+rx_men15_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "2.10.Rxn_men15_proph_arima.rtf"))
+rx_men15_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "2.10.Rxn_men15_proph_arima.tex"))
+```  
+  
+#### Gráficos de pronóstico
+  
+```{r}
+cowplot::plot_grid(rxad_men15_pron$arima_plot, 
+                  rxad_men15_prophet_plot, 
+                  labels = c('Arima', 'Prophet'))
+
+library(cowplot)
+rx_men15_plots_aligned  <- align_plots(rxad_men15_pron$arima_plot + theme(legend.position = "none")  + ggtitle('ARIMA (4,0,1)'), 
+                     rxad_men15_prophet_plot + theme(legend.position = "none")  + ggtitle('Prophet'),
+                     align = 'v', 
+                     axis = 'l')
+
+rx_men15_arima_legend <- get_legend(rxad_men15_pron$arima_plot)
+
+(rx_men15_final_plot <- cowplot::plot_grid(rx_men15_plots_aligned[[1]], 
+                   rx_men15_plots_aligned[[2]], 
+                  rx_men15_arima_legend, 
+                  label_size = 10,
+                  rel_heights =  c(1, 1, .1),
+                  nrow = 3))
+
+png(filename = file.path(img_folder, "2.10.Rx_men15_pron_final.png"),
+    width = 720, height = 520, units = "px")
+rx_men15_final_plot
+dev.off()
+```
+
+## Reacciones adversas - Mayores a 15 años
+
+```{r}
+rxad_may15 <- get_ts_from_agg_df(agg_intox_rxd, 
+                                 filtro_etario = "Mayor a 15 años")
+
+(rx_may5_prop <- sum(rxad_may15$ts_full)/nrow(intox_rxad))
+
+ rxad_may15_tsibble <- rxad_may15$agg_data %>% 
+  as_tsibble(index = TIEMPO) %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO))
+
+rxad_may15_train <- rxad_may15_tsibble %>% 
+  filter(TIEMPO < tsibble::yearmonth("2020-03"))
+rxad_may15_test <- rxad_may15_tsibble %>% 
+  filter(TIEMPO >= tsibble::yearmonth("2020-03"))
+```
+
+### Changepoint - Enfoque cambio de nivel
+
+```{r}
+rxad_may15_cpts <- get_change_points(rxad_may15$ts_full)
+rxad_may15_cpts$cp_plot
+```
+  
+### ARIMA - Enfoque Intervencion  
+  
+#### Estacionariedad y Autocorrelogramas Intervención   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+# DescTools::PlotACF(rxad_may15$ts_full, main = "")
+
+rxad_may15_tsibble %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+rxad_may15_tsibble |>
+  features(TOTAL, unitroot_nsdiffs)
+
+rxad_may15_tsibble |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+rxad_may15_tsibble |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+rxad_may15_tsibble |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+rxad_may15_tsibble |>
+  gg_tsdisplay(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+rxad_may15_tsibble |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  labs(title = "Diferenciado", y="")
+
+png(filename = file.path(img_folder, "2.11.Rx_may15_dif.png"),
+    width = 720, height = 480, units = "px")
+rxad_may15_tsibble |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  ylab("Total Diferenciado (1)")
+dev.off()
+```  
+  
+#### Modelaje Intervención  
+  
+##### Selección del Modelo  
+  
+```{r}
+inter <- c(rep(0, 62), rep(1, 34))
+timeperiod <- 96
+
+# rxad_may15_inter_model <- rxad_may15_tsibble %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE))
+
+rxad_may15_inter_model <- rxad_may15_tsibble %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_auto = ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE),
+    arima_010 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,0) + inter),
+    arima_011 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,0) + inter),
+    arima_110 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,0) + inter),
+    arima_111 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,0) + inter),
+    arima_012 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(0,0,0) + inter),
+    arima_210 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,0) + inter),
+    arima_112 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(0,0,0) + inter),
+    arima_211 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,0) + inter),
+    arima_212 = ARIMA(TOTAL ~ pdq(2,1,2) + PDQ(0,0,0) + inter),
+    
+    arima_013 = ARIMA(TOTAL ~ pdq(0,1,3) + PDQ(0,0,0) + inter),
+    arima_310 = ARIMA(TOTAL ~ pdq(3,1,0) + PDQ(0,0,0) + inter),
+    arima_113 = ARIMA(TOTAL ~ pdq(1,1,3) + PDQ(0,0,0) + inter),
+    arima_311 = ARIMA(TOTAL ~ pdq(3,1,1) + PDQ(0,0,0) + inter),
+    arima_312 = ARIMA(TOTAL ~ pdq(3,1,2) + PDQ(0,0,0) + inter),
+    arima_213 = ARIMA(TOTAL ~ pdq(2,1,3) + PDQ(0,0,0) + inter),
+    arima_313 = ARIMA(TOTAL ~ pdq(3,1,3) + PDQ(0,0,0) + inter),
+    
+    arima_014 = ARIMA(TOTAL ~ pdq(0,1,4) + PDQ(0,0,0) + inter),
+    arima_410 = ARIMA(TOTAL ~ pdq(4,1,0) + PDQ(0,0,0) + inter),
+    arima_114 = ARIMA(TOTAL ~ pdq(1,1,4) + PDQ(0,0,0) + inter),
+    arima_411 = ARIMA(TOTAL ~ pdq(4,1,1) + PDQ(0,0,0) + inter),
+    arima_412 = ARIMA(TOTAL ~ pdq(4,1,2) + PDQ(0,0,0) + inter),
+    arima_214 = ARIMA(TOTAL ~ pdq(2,1,4) + PDQ(0,0,0) + inter),
+    arima_314 = ARIMA(TOTAL ~ pdq(3,1,4) + PDQ(0,0,0) + inter),
+    arima_413 = ARIMA(TOTAL ~ pdq(4,1,3) + PDQ(0,0,0) + inter),
+    arima_414 = ARIMA(TOTAL ~ pdq(4,1,4) + PDQ(0,0,0) + inter),
+  
+    arima_015 = ARIMA(TOTAL ~ pdq(0,1,5) + PDQ(0,0,0) + inter),
+    arima_115 = ARIMA(TOTAL ~ pdq(1,1,5) + PDQ(0,0,0) + inter),
+    arima_215 = ARIMA(TOTAL ~ pdq(2,1,5) + PDQ(0,0,0) + inter),
+    arima_315 = ARIMA(TOTAL ~ pdq(3,1,5) + PDQ(0,0,0) + inter),
+    arima_415 = ARIMA(TOTAL ~ pdq(4,1,5) + PDQ(0,0,0) + inter),
+    
+    arima_010_100_4 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 4) + inter),
+    arima_011_100_4 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 4) + inter),
+    arima_110_100_4 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 4) + inter),
+    arima_111_100_4 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 4) + inter),
+    
+    arima_010_001_4 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,1, period = 4) + inter),
+    arima_011_001_4 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,1, period = 4) + inter),
+    arima_110_001_4 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,1, period = 4) + inter),
+    arima_111_001_4 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,1, period = 4) + inter),
+    
+    arima_010_002_4 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,2, period = 4) + inter),
+    arima_011_002_4 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,2, period = 4) + inter),
+    arima_110_002_4 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,2, period = 4) + inter),
+    arima_111_002_4 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,2, period = 4) + inter),
+    
+    arima_010_003_4 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,3, period = 4) + inter),
+    arima_011_003_4 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,3, period = 4) + inter),
+    arima_110_003_4 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,3, period = 4) + inter),
+    arima_111_003_4 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,3, period = 4) + inter),
+    
+    arima_010_001_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_011_001_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,1, period = 6) + inter),
+    arima_110_001_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_111_001_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,1, period = 6) + inter),
+    
+    arima_010_002_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,2, period = 6) + inter),
+    arima_011_002_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,2, period = 6) + inter),
+    arima_110_002_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,2, period = 6) + inter),
+    arima_111_002_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,2, period = 6) + inter),
+    
+    arima_010_001_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_011_001_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,1, period = 12) + inter),
+    arima_110_001_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_111_001_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,1, period = 12) + inter)
+  )
+
+rxad_may15_inter_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(rxad_may15_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(rx_may15_arima_table <- glance(rxad_may15_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ))
+
+rx_may15_arima_int_gt <- rx_may15_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+rx_may15_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.11.Rx_may15_arima_int.rtf"))
+rx_may15_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.11.Rx_may15_arima_int.tex"))
+
+rxad_may15_inter_sel_model <- rxad_may15_inter_model |>
+  select(arima_011_001_12)
+
+# arima_011_200_12_auto el sar2 no es significativo
+
+rxad_may15_inter_sel_model |>
+  report()
+
+rx_may15_arima_gt <- rxad_may15_inter_sel_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "inter" ~ "Intervención",
+      term == "intercept" ~ "Intercepto",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+rx_may15_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.12.Rx_may15_arima_int_mod.rtf"))
+rx_may15_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.12.Rx_may15_arima_int_mod.tex"))
+
+png(filename = file.path(img_folder, "2.13.Rx_may15_int_resids.png"),
+    width = 720, height = 480, units = "px")
+rxad_may15_inter_sel_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+
+rxad_may15_inter_sel_model |> 
+  gg_tsresiduals(lag=timeperiod)
+```
+  
+##### Verificación de Supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(rxad_may15_inter_lb <- augment(rxad_may15_inter_model) |>
+  filter(.model == "arima_011_001_12") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 2))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+  
+###### Raíces Unitarias  
+  
+```{r}
+rxad_may15_inter_sel_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "2.12.Rx_may15_int_roots.png"),
+    width = 720, height = 480, units = "px")
+rxad_may15_inter_sel_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+  
+###### Normalidad de los residuos  
+  
+```{r}
+# Normalidad de Residuos - ARIMA
+rxad_may15_inter_ts_residuals <- residuals(rxad_may15_inter_sel_model, 
+                                    type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(rxad_may15_inter_ts_residuals)
+
+(rxad_may15_inter_jb_arima <- tseries::jarque.bera.test(rxad_may15_inter_ts_residuals))
+
+(rxad_may15_inter_shap_arima <-shapiro.test(rxad_may15_inter_ts_residuals))
+
+car::qqPlot(rxad_may15_inter_ts_residuals)
+
+# Normalidad de residuos - Regresion
+rxad_may15_inter_reg_residuals <- residuals(rxad_may15_inter_sel_model, type = "regression") %>% as_tibble() %>% pull(.resid)
+
+mean(rxad_may15_inter_reg_residuals)
+
+(rxad_may15_inter_shap_reg <- shapiro.test(rxad_may15_inter_reg_residuals))
+
+car::qqPlot(rxad_may15_inter_reg_residuals)
+
+# Visualizacion ambos graficos
+bind_rows(
+    `Regression residuals` =
+        as_tibble(residuals(rxad_may15_inter_sel_model, type = "regression")),
+    `ARIMA residuals` =
+        as_tibble(residuals(rxad_may15_inter_sel_model, type = "innovation")),
+    .id = "type"
+  ) |>
+  mutate(
+    TIEMPO = as_date(TIEMPO)
+  ) |>
+  ggplot(aes(x = TIEMPO, y = .resid)) +
+  geom_line() +
+  facet_grid(vars(type))
+```
+  
+##### Agrupación de resultados  
+  
+```{r}
+(summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Reacciones a Medicamentos",
+    Población = "Mayores de 15 años",
+    Enfoque = "Intervención",
+    Modelo = "Regresion con ARIMA (0,1,1)(0,0,1)[12]",
+    # Significancia_intervencion = "Si",
+    # ACF_Residuales = "1 de 96 fuera",
+    # Histograma = "Aproximadamente Normal sesgado a la derecha",
+    Residuals_LJung_Box_Test_ARIMA = round(rxad_may15_inter_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(rxad_may15_inter_jb_arima$p.value, 2),
+    # Residuals_Shapiro_Test_ARIMA = round(rxad_may15_inter_shap_arima$p.value, 2),
+    Residuals_Shapiro_Wilk_Regression = round(rxad_may15_inter_shap_reg$p.value, 2)
+  )))
+```
+  
+#### ARIMA - Enfoque Pronostico  
+  
+#### Estacionariedad y Autocorrelogramas Pronóstico   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+rxad_may15_train %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+rxad_may15_train |>
+  features(TOTAL, unitroot_nsdiffs)
+
+rxad_may15_train |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+rxad_may15_train |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+rxad_may15_train |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+  
+rxad_may15_train |>
+  gg_tsdisplay(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+png(filename = file.path(img_folder, "2.14.Rx_may15_pron_dif.png"),
+    width = 720, height = 480, units = "px")
+rxad_may15_train |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  ylab("Total Diferenciado (1)")
+dev.off()
+```    
+  
+#### Modelaje Pronóstico     
+  
+##### Selección del Modelo  
+  
+```{r}
+# rxad_may15_pron_model <- rxad_may15_train %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE))
+# 
+# rxad_may15_pron_model |>
+#   pivot_longer(everything(),
+#                names_to = "Model name",
+#                values_to = "Orders")
+
+rxad_may15_pron_model <- rxad_may15_train %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_auto = ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE),
+    arima_010 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,0)),
+    arima_011 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,0)),
+    arima_110 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,0)),
+    arima_111 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,0)),
+    
+    arima_010_100_3 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 3)),
+    arima_011_100_3 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 3)),
+    arima_110_100_3 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 3)),
+    arima_111_100_3 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 3)),
+    
+    arima_010_200_3 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(2,0,0, period = 3)),
+    arima_011_200_3 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(2,0,0, period = 3)),
+    arima_110_200_3 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(2,0,0, period = 3)),
+    arima_111_200_3 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(2,0,0, period = 3)),
+    
+    arima_010_300_3 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(3,0,0, period = 3)),
+    arima_011_300_3 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(3,0,0, period = 3)),
+    arima_110_300_3 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(3,0,0, period = 3)),
+    arima_111_300_3 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(3,0,0, period = 3))
+  )
+
+rxad_may15_pron_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(rxad_may15_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(rx_may15_pron_arima_table <- glance(rxad_may15_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ) %>% 
+    slice(-2))
+
+rx_may15_arima_pron_gt <- rx_may15_pron_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+rx_may15_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.13.Rx_may15_arima_pron.rtf"))
+rx_may15_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.13.Rx_may15_arima_pron.tex"))
+
+rxad_may15_final_arima_model <- rxad_may15_pron_model |>
+  select(arima_011) 
+
+rxad_may15_final_arima_model |>
+  report()
+
+rx_may15_arima_gt <- rxad_may15_final_arima_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "constant" ~ "Constante",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+rx_may15_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.14.Rx_may15_arima_pron_mod.rtf"))
+rx_may15_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "2.14.Rx_may15_arima_pron_mod.tex"))
+
+png(filename = file.path(img_folder, "2.16.Rx_may15_pron_resids.png"),
+    width = 720, height = 480, units = "px")
+rxad_may15_final_arima_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+
+rxad_may15_final_arima_model |> 
+  gg_tsresiduals(lag=timeperiod)
+```
+  
+##### Verificación de supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(rxad_may15_lb <-  augment(rxad_may15_pron_model) |>
+  filter(.model == "arima_011") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 1))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+   
+###### Raíces Unitarias
+   
+```{r}
+rxad_may15_final_arima_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "2.15.Rx_may15_pron_roots.png"),
+    width = 720, height = 480, units = "px")
+rxad_may15_final_arima_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+   
+###### Normalidad de los residuos   
+   
+```{r}
+# Normalidad de Residuos - ARIMA
+rxad_may15_residuals <- residuals(rxad_may15_final_arima_model, type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(rxad_may15_residuals)
+
+(rxad_may15_jb_arima <- tseries::jarque.bera.test(rxad_may15_residuals))
+
+(rxad_may15_shap_arima <- shapiro.test(rxad_may15_residuals))
+
+car::qqPlot(rxad_may15_residuals)
+```
+   
+##### Agrupación de Resultados   
+   
+```{r}
+rxad_may15_pron <- gen_pronostic_plot2(rxad_may15_train, 
+                                      rxad_may15_test,
+                                      rxad_may15_final_arima_model,
+                                      h_forecast = 34)
+
+rxad_may15_pron$pron_df <- rxad_may15_pron$pron_df %>% 
+  mutate(
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(rxad_may15_pron$pron_df$out)
+rxad_may15_pron$pron_df$ds[rxad_may15_pron$pron_df$out == 1]
+
+rxad_may15_arima_sel_df <- forecast::accuracy(rxad_may15_pron$pron_df$yhat,
+                                                    rxad_may15_pron$pron_df$y) %>%
+  as_tibble() %>% 
+  mutate(Modelo = "ARIMA (0,1,1)",
+         Metric_Type = "Test set")
+
+summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Reacciones a Medicamentos",
+    Población = "Mayores de 15 años",
+    Enfoque = "Pronóstico",
+    Modelo = "ARIMA (0,1,1)",
+    # ACF_Residuales = "Todos dentro",
+    # Histograma = "Aproximadamente Normal sesgado a la derecha",
+    Residuals_LJung_Box_Test_ARIMA = round(rxad_may15_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(rxad_may15_jb_arima$p.value, 2),
+    # Residuals_Shapiro_Test_ARIMA = round(rxad_may15_shap_arima$p.value, 2)
+  ))
+```
+  
+#### Prophet - Enfoque Pronóstico
+  
+```{r}
+# rxad_may15_prophet_mod <- generate_prophet_forecast(rxad_may15_train,
+#                                               rxad_may15_test,
+#                                               periods = 34)
+# write_rds(rxad_may15_prophet_mod, "modelos/rxad_may15_prophet.RDS")
+rxad_may15_prophet <- readRDS("modelos/rxad_may15_prophet.RDS")
+
+rxad_may15_prophet$acc_consolidated %>%
+  mutate(model = 1:nrow(rxad_may15_prophet$acc_consolidated)) %>% 
+  arrange(RMSE, MAPE)
+
+rxad_may15_sel_prophet <- 59
+
+rx_may15_forecast_tb <- rxad_may15_prophet$forecast_tb_list[[rxad_may15_sel_prophet]] %>% 
+  mutate(
+    y = rxad_may15_pron$pron_df$y,
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(rx_may15_forecast_tb$out)
+rx_may15_forecast_tb$ds[rx_may15_forecast_tb$out == 1]
+
+rxad_may15_prophet_plot <- generate_prophet_plot(rxad_may15$ts_train, 
+                      rxad_may15$ts_test, 
+                      forecast_tb = rxad_may15_prophet$forecast_tb_list[[rxad_may15_sel_prophet]])
+
+(rx_may15_both_metrics <- combine_model_metrics(rxad_may15_arima_sel_df, 
+                      rxad_may15_prophet$acc_consolidated[rxad_may15_sel_prophet,]) %>% 
+  arrange(RMSE, MAPE)%>% 
+    mutate_if(is.numeric, ~round(., 2)) %>% 
+    select(Modelo, RMSE, MAPE) %>% 
+  arrange(RMSE, MAPE))
+
+rx_may15_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "2.15.Rx_may15_proph_arima.rtf"))
+rx_may15_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "2.15.Rx_may15_proph_arima.tex"))
+```  
+  
+#### Gráficos de pronóstico
+  
+```{r}
+library(cowplot)
+rx_may15_plots_aligned  <- align_plots(rxad_may15_pron$arima_plot + theme(legend.position = "none")  + ggtitle('ARIMA (0,1,1)'), 
+                     rxad_may15_prophet_plot + theme(legend.position = "none")  + ggtitle('Prophet'),
+                     align = 'v', 
+                     axis = 'l')
+
+rx_may15_arima_legend <- get_legend(rxad_may15_pron$arima_plot)
+
+(rx_may15_final_plot <- cowplot::plot_grid(rx_may15_plots_aligned[[1]], 
+                   rx_may15_plots_aligned[[2]], 
+                  rx_may15_arima_legend, 
+                  label_size = 10,
+                  rel_heights =  c(1, 1, .1),
+                  nrow = 3))
+
+png(filename = file.path(img_folder, "2.17.Rx_may15_pron_final.png"),
+    width = 720, height = 520, units = "px")
+rx_may15_final_plot
+dev.off()
+```  
+  
+  
+```{r}
+summary_arima_mods %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "2.16.Arima_supuestos.rtf"))
+summary_arima_mods %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "2.16.Arima_supuestos.tex"))
+```

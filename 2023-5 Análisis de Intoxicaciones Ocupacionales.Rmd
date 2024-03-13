@@ -1,0 +1,1013 @@
+---
+title: "Análisis de Intoxicaciones Ocupacionales"
+author: "Edgardo Gutiérrez Vega"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    downcute_theme: "chaos"
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 99)
+read_folder <- "datos_procesados"
+save_graficos <- "resultados_graficos"
+causa_ref <- "Ocupacional"
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(gtsummary)
+library(sf)
+library(FactoMineR)
+library(factoextra)
+source("R/tibl_to_ts.R")
+source("R/ggplot_ts.R")
+source("R/plot_map.R")
+source("R/get_ts_from_agg_df.R")
+source("R/get_arima_model.R")
+source("R/get_change_points.R")
+source("R/generate_counts.R")
+source("R/generate_counts_v2.R")
+source("R/generate_dtw_cluster_plot.R")
+source("R/analisis_correspondencia.R")
+source("R/get_cumulative_frequencies.R")
+source("R/generate_prophet_forecast.R")
+source("R/gg_arma_spanish.R")
+source("R/gg_tsresiduals_spanish.R")
+source("R/gg_tsdisplay_spanish.R")
+library(fable)
+library(feasts)
+img_folder <- "0.documento_final/img_finales/5.Ocupacionales"
+tab_folder <- "0.documento_final/tab_finales/5.Ocupacionales"
+intox_ocu <- read_rds(file.path(read_folder, "intox_ocupacional.RDS"))
+pob_year_sexo_ge_canton <- read_rds(file.path(read_folder, "pob_data.RDS"))
+meds <- read_rds(file.path(read_folder, "meds.RDS"))
+cantones_st <- read_rds(file.path(read_folder, "cantones_st.RDS"))
+table_count <- 1
+summary_arima_mods <- tibble()
+```
+
+## Análisis Intoxicaciones Ocupacionales
+  
+### Procesamiento de datos de intoxicaciones ocupacionales
+  
+En el caso de las intoxicaciones ocupacionales, el Cuadro  `r table_count` muestra que los grupos principales de interés con los que se reporta este tipo de intoxicaciones son los plaguicidas y los químicos, con más de 2800 mil casos, equivalente a un 88% de los casos relacionados a esta causa.
+  
+```{r}
+intox_ocu$TOXICO_INTERES1 %>% table %>% prop.table() %>% sort
+
+intox_ocu_freq_table <- get_cumulative_frequencies(intox_ocu, "TOXICO_INTERES1")
+
+table_count <- table_count + 1
+
+(intox_ocu_export_table <- intox_ocu_freq_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  mutate(TOX_FREQ = paste0(TOX_FREQ, "%"),
+         TOX_FREQ_CUMSUM = paste0(TOX_FREQ_CUMSUM, "%")) %>% 
+  rename(
+    `Tipo de Tóxico Principal` = TOXICO_INTERES1,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+intox_ocu_export_table %>% 
+  gt::gtsave(file.path(tab_folder, "5.1.Ocupacionales.rtf"))
+intox_ocu_export_table %>% 
+  gt::gtsave(file.path(tab_folder, "5.1.Ocupacionales.tex"))
+
+```
+  
+Dado que para el CNCI los plaguicidas son un grupo de interés, se decidió proceder con solamente el análisis de este grupo debido a que correspondió prácticamente al 70% de los datos. De acuerdo con el Cuadro `r table_count`, por lo general, más del 90% de estos casos a lo largo de todos los años correspondió a reportes por hombres, por esta razón se decidió enfocar el análisis en esta población.
+  
+```{r fig.width=10}
+intox_ocu_fltd <- intox_ocu %>% 
+  filter(TOXICO_INTERES1 == "Plaguicidas")
+
+table_count <- table_count + 1
+
+intox_ocu_fltd %>%
+  select(YEAR, SEXO, GRUPO_ETARIO, TOXICO_INTERES1) %>% 
+  tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(TOXICO_INTERES1 ~ "Toxico de Interés"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**")
+
+(intox_ocu_sum_sexo_table <- intox_ocu_fltd %>%
+  select(YEAR, SEXO) %>% 
+  tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(SEXO ~ "Sexo"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**") %>% 
+    as_gt())
+
+intox_ocu_sum_sexo_table %>% 
+  gt::gtsave(file.path(tab_folder, "5.2.Ocupacionales.rtf"))
+intox_ocu_sum_sexo_table %>% 
+  gt::gtsave(file.path(tab_folder, "5.2.Ocupacionales.tex"))
+```           
+  
+Considerando lo anterior,  el Cuadro `r table_count` permite observar que un 82% de los casos del 2022 correspondieron a hombres con edades entre los 20 y 59 años. Se procedió a agruparlos en décadas, con el fin de centralizar mejor la cantidad de casos para observar la tendencia, filtrando casos menores a 15 años.   
+  
+```{r fig.width=10}
+intox_ocu_fltd <- intox_ocu_fltd %>% 
+  filter(SEXO == "Masculino")
+
+table_count <- table_count + 1
+
+intox_ocu_fltd %>%
+  select(YEAR, GRUPO_ETARIO) %>% 
+       tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**")
+```      
+  
+Como era de esperar, la tendencia se mantuvo.  
+  
+```{r}
+intox_ocu_fltd <- intox_ocu_fltd %>% 
+  filter(EDAD_A >= 15) %>% 
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      GRUPO_ETARIO %in% c("20 a 24 años", "25 a 29 años") ~ "20 a 29 años",
+      GRUPO_ETARIO %in% c("30 a 34 años", "35 a 39 años") ~ "30 a 39 años",
+      GRUPO_ETARIO %in% c("40 a 44 años", "45 a 49 años") ~ "40 a 49 años",
+      GRUPO_ETARIO %in% c("50 a 54 años", "55 a 59 años", "60 a 64 años") ~ "50 a 64 años",
+      GRUPO_ETARIO %in% c("65 a 69 años", "70 a 74 años", "Mayor a 75 años") ~ "Mayor a 65 años",
+      TRUE ~ GRUPO_ETARIO
+    )
+  )
+
+table_count <- table_count + 1
+
+intox_ocu_fltd %>%
+  select(YEAR, GRUPO_ETARIO2, TOXICO1) %>% 
+       tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**")
+```    
+  
+El Cuadro `r table_count` presenta el detalle de los tóxicos específicos relacionados con los reportes de intoxicación ocupacional, siendo el diazinon, plaguicidas desconocidos, glifosato y paraquat los principales tóxicos reportados con aproximadamente el 43% de los casos totales en todo el período analizado.  
+  
+```{r}
+table_count <- table_count + 1
+
+(intox_ocu_sel_toxicos <- get_cumulative_frequencies(intox_ocu_fltd, "TOXICO1") %>% 
+  mutate(
+    TOXICO1 = case_when(
+      TOX_FREQ < 2 ~ "Otros",
+      TRUE ~ TOXICO1
+    ),
+    TOXICO1 = str_to_title(TOXICO1)
+  ) %>% 
+  group_by(TOXICO1) %>% 
+  summarise(
+    TOX_N = sum(TOX_N),
+    TOX_FREQ = sum(TOX_FREQ)
+  ) %>%
+  arrange(desc(TOX_FREQ)) %>% 
+  arrange(TOXICO1 == "Otros") %>% 
+  mutate(TOX_FREQ_CUMSUM = cumsum(TOX_FREQ)) %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  rename(
+    `Tóxico Principal` = TOXICO1,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+intox_ocu_sel_toxicos %>% 
+  gt::gtsave(file.path(tab_folder, "5.3.Ocupacionales.rtf"))
+intox_ocu_sel_toxicos %>% 
+  gt::gtsave(file.path(tab_folder, "5.3.Ocupacionales.tex"))
+```    
+  
+```{r}
+table_count <- table_count + 1
+
+(intox_ocu_sel_canton <- get_cumulative_frequencies(intox_ocu_fltd, "CANTON") %>% 
+  mutate(
+    CANTON = case_when(
+      TOX_FREQ < 2 ~ "Otros",
+      TRUE ~ CANTON
+    ),
+    CANTON = str_to_title(CANTON)
+  ) %>% 
+  group_by(CANTON) %>% 
+  summarise(
+    TOX_N = sum(TOX_N),
+    TOX_FREQ = sum(TOX_FREQ)
+  ) %>%
+  arrange(desc(TOX_FREQ)) %>% 
+  arrange(CANTON == "Otros") %>% 
+  mutate(TOX_FREQ_CUMSUM = cumsum(TOX_FREQ)) %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  rename(
+    `Cantón` = CANTON,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+intox_ocu_sel_canton %>% 
+  gt::gtsave(file.path(tab_folder, "5.3.1.Ocupacionales.rtf"))
+intox_ocu_sel_canton %>% 
+  gt::gtsave(file.path(tab_folder, "5.3.1.Ocupacionales.tex"))
+```      
+  
+## Dynamic Time Warping Clustering - Ocupacionales  
+  
+https://damien-datasci-blog.netlify.app/post/time-series-clustering-with-dynamic-time-warp/  
+  
+### DTW - Plaguicidas - Edad   
+  
+```{r fig.width=10}
+agg_intox_ocu_std <- generate_counts2(
+  intox_ocu_fltd, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_ocu <- generate_counts2(
+  intox_ocu_fltd, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+png(filename = file.path(img_folder, "5.1.Ocupacional estadarizado.png"),
+    width = 720, height = 490, units = "px")
+generate_dtw_cluster_plot(agg_intox_ocu_std, k_clusters = 2, lab_y = "Totales Estandarizados")
+dev.off()
+png(filename = file.path(img_folder, "5.1.Ocupacional original.png"),
+    width = 720, height = 490, units = "px")
+generate_dtw_cluster_plot(agg_intox_ocu, k_clusters = 2, lab_y = "Total de Casos Reportados")  
+dev.off()
+```
+  
+## Ocupacionales - Plaguicidas en hombres mayores de 15 años
+
+```{r}
+ocu_plag <- get_ts_from_agg_df(agg_intox_ocu)
+
+ocu_plag_tsibble <- ocu_plag$agg_data %>% 
+  as_tsibble(index = TIEMPO) %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO))
+
+ocu_plag_train <- ocu_plag_tsibble %>% 
+  filter(TIEMPO < tsibble::yearmonth("2020-03"))
+ocu_plag_test <- ocu_plag_tsibble %>% 
+  filter(TIEMPO >= tsibble::yearmonth("2020-03"))
+```
+
+### Changepoint - Enfoque cambio de nivel
+
+```{r}
+ocu_plag_cpts <- get_change_points(ocu_plag$ts_full)
+ocu_plag_cpts$cp_plot
+```  
+  
+### ARIMA - Enfoque Intervencion  
+  
+#### Estacionariedad y Autocorrelogramas Intervención   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+# DescTools::PlotACF(ocu_plag$ts_full, main = "")
+
+ocu_plag_tsibble %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+ocu_plag_tsibble |>
+  features(TOTAL, unitroot_nsdiffs)
+
+ocu_plag_tsibble |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+ocu_plag_tsibble |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+ocu_plag_tsibble |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+ocu_plag_tsibble |>
+  gg_tsdisplay(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+ocu_plag_tsibble |>
+  gg_tsdisplay(difference(TOTAL, 12),
+               plot_type='partial', lag=36) +
+  labs(title = "Diferenciado Estacional", y="")
+
+png(filename = file.path(img_folder, "5.2.Ocupacional dif.png"),
+    width = 720, height = 480, units = "px")
+ocu_plag_tsibble |>
+  gg_tsdisplay(difference(TOTAL, 12),
+               plot_type='partial', lag=36)  +
+  ylab("Total Diferenciado (12)")
+dev.off()
+
+ocu_plag_tsibble |>
+  gg_tsdisplay(difference(difference(TOTAL, 12), 1),
+               plot_type='partial', lag=36) +
+  labs(title = "Diferenciado Doble Estacional + Unitario", y="")
+```  
+  
+#### Modelaje Intervención  
+  
+##### Selección del Modelo  
+  
+```{r}
+inter <- c(rep(0, 62), rep(1, 34))
+timeperiod <- 96
+# 
+# ocu_plag_inter_model <- ocu_plag_tsibble %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE))
+
+ocu_plag_inter_model <- ocu_plag_tsibble %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_101_011_12_auto = ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE),
+
+    arima_000_010_12 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,1,0, period = 12) + inter),
+    arima_001_010_12 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,1,0, period = 12) + inter),
+    arima_100_010_12 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,1,0, period = 12) + inter),
+    arima_101_010_12 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,1,0, period = 12) + inter),
+    arima_002_010_12 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(0,1,0, period = 12) + inter),
+    arima_200_010_12 = ARIMA(TOTAL ~ pdq(2,0,0) + PDQ(0,1,0, period = 12) + inter),
+    arima_102_010_12 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(0,1,0, period = 12) + inter),
+    arima_201_010_12 = ARIMA(TOTAL ~ pdq(2,0,1) + PDQ(0,1,0, period = 12) + inter),
+    arima_202_010_12 = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(0,1,0, period = 12) + inter),
+    
+    arima_003_010_12 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(0,1,0, period = 12) + inter),
+    arima_300_010_12 = ARIMA(TOTAL ~ pdq(3,0,0) + PDQ(0,1,0, period = 12) + inter),
+    arima_103_010_12 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(0,1,0, period = 12) + inter),
+    arima_301_010_12 = ARIMA(TOTAL ~ pdq(3,0,1) + PDQ(0,1,0, period = 12) + inter),
+    arima_302_010_12 = ARIMA(TOTAL ~ pdq(3,0,2) + PDQ(0,1,0, period = 12) + inter),
+    arima_203_010_12 = ARIMA(TOTAL ~ pdq(2,0,3) + PDQ(0,1,0, period = 12) + inter),
+    arima_303_010_12 = ARIMA(TOTAL ~ pdq(3,0,3) + PDQ(0,1,0, period = 12) + inter),
+    
+    arima_004_010_12 = ARIMA(TOTAL ~ pdq(0,0,4) + PDQ(0,1,0, period = 12) + inter),
+    arima_104_010_12 = ARIMA(TOTAL ~ pdq(1,0,4) + PDQ(0,1,0, period = 12) + inter),
+    arima_204_010_12 = ARIMA(TOTAL ~ pdq(2,0,4) + PDQ(0,1,0, period = 12) + inter),
+    arima_304_010_12 = ARIMA(TOTAL ~ pdq(3,0,4) + PDQ(0,1,0, period = 12) + inter),
+    
+    arima_000_110_12 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(1,1,0, period = 12) + inter),
+    arima_001_110_12 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(1,1,0, period = 12) + inter),
+    arima_100_110_12 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(1,1,0, period = 12) + inter),
+    arima_101_110_12 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(1,1,0, period = 12) + inter),
+    arima_002_110_12 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(1,1,0, period = 12) + inter),
+    arima_200_110_12 = ARIMA(TOTAL ~ pdq(2,0,0) + PDQ(1,1,0, period = 12) + inter),
+    arima_102_110_12 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(1,1,0, period = 12) + inter),
+    arima_201_110_12 = ARIMA(TOTAL ~ pdq(2,0,1) + PDQ(1,1,0, period = 12) + inter),
+    arima_202_110_12 = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(1,1,0, period = 12) + inter),
+  
+    arima_003_110_12 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(1,1,0, period = 12) + inter),
+    arima_300_110_12 = ARIMA(TOTAL ~ pdq(3,0,0) + PDQ(1,1,0, period = 12) + inter),
+    arima_103_110_12 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(1,1,0, period = 12) + inter),
+    arima_301_110_12 = ARIMA(TOTAL ~ pdq(3,0,1) + PDQ(1,1,0, period = 12) + inter),
+    arima_302_110_12 = ARIMA(TOTAL ~ pdq(3,0,2) + PDQ(1,1,0, period = 12) + inter),
+    arima_203_110_12 = ARIMA(TOTAL ~ pdq(2,0,3) + PDQ(1,1,0, period = 12) + inter),
+    arima_303_110_12 = ARIMA(TOTAL ~ pdq(3,0,3) + PDQ(1,1,0, period = 12) + inter),
+    
+    arima_004_110_12 = ARIMA(TOTAL ~ pdq(0,0,4) + PDQ(1,1,0, period = 12) + inter),
+    arima_104_110_12 = ARIMA(TOTAL ~ pdq(1,0,4) + PDQ(1,1,0, period = 12) + inter),
+    arima_204_110_12 = ARIMA(TOTAL ~ pdq(2,0,4) + PDQ(1,1,0, period = 12) + inter),
+    arima_304_110_12 = ARIMA(TOTAL ~ pdq(3,0,4) + PDQ(1,1,0, period = 12) + inter),
+    
+    arima_000_011_12 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,1,1, period = 12) + inter),
+    arima_001_011_12 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,1,1, period = 12) + inter),
+    arima_100_011_12 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,1,1, period = 12) + inter),
+    arima_101_011_12 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,1,1, period = 12) + inter),
+    arima_002_011_12 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(0,1,1, period = 12) + inter),
+    arima_200_011_12 = ARIMA(TOTAL ~ pdq(2,0,0) + PDQ(0,1,1, period = 12) + inter),
+    arima_102_011_12 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(0,1,1, period = 12) + inter),
+    arima_201_011_12 = ARIMA(TOTAL ~ pdq(2,0,1) + PDQ(0,1,1, period = 12) + inter),
+    arima_202_011_12 = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(0,1,1, period = 12) + inter),
+    
+    arima_003_011_12 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(0,1,1, period = 12) + inter),
+    arima_300_011_12 = ARIMA(TOTAL ~ pdq(3,0,0) + PDQ(0,1,1, period = 12) + inter),
+    arima_103_011_12 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(0,1,1, period = 12) + inter),
+    arima_301_011_12 = ARIMA(TOTAL ~ pdq(3,0,1) + PDQ(0,1,1, period = 12) + inter),
+    arima_302_011_12 = ARIMA(TOTAL ~ pdq(3,0,2) + PDQ(0,1,1, period = 12) + inter),
+    arima_203_011_12 = ARIMA(TOTAL ~ pdq(2,0,3) + PDQ(0,1,1, period = 12) + inter),
+    arima_303_011_12 = ARIMA(TOTAL ~ pdq(3,0,3) + PDQ(0,1,1, period = 12) + inter),
+    
+    arima_004_011_12 = ARIMA(TOTAL ~ pdq(0,0,4) + PDQ(0,1,1, period = 12) + inter),
+    arima_104_011_12 = ARIMA(TOTAL ~ pdq(1,0,4) + PDQ(0,1,1, period = 12) + inter),
+    arima_204_011_12 = ARIMA(TOTAL ~ pdq(2,0,4) + PDQ(0,1,1, period = 12) + inter),
+    arima_304_011_12 = ARIMA(TOTAL ~ pdq(3,0,4) + PDQ(0,1,1, period = 12) + inter),
+    
+    arima_000_111_12 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(1,1,1, period = 12) + inter),
+    arima_001_111_12 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(1,1,1, period = 12) + inter),
+    arima_100_111_12 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(1,1,1, period = 12) + inter),
+    arima_101_111_12 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(1,1,1, period = 12) + inter),
+    arima_002_111_12 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(1,1,1, period = 12) + inter),
+    arima_200_111_12 = ARIMA(TOTAL ~ pdq(2,0,0) + PDQ(1,1,1, period = 12) + inter),
+    arima_102_111_12 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(1,1,1, period = 12) + inter),
+    arima_201_111_12 = ARIMA(TOTAL ~ pdq(2,0,1) + PDQ(1,1,1, period = 12) + inter),
+    arima_202_111_12 = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(1,1,1, period = 12) + inter),
+    
+    arima_003_111_12 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(1,1,1, period = 12) + inter),
+    arima_300_111_12 = ARIMA(TOTAL ~ pdq(3,0,0) + PDQ(1,1,1, period = 12) + inter),
+    arima_103_111_12 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(1,1,1, period = 12) + inter),
+    arima_301_111_12 = ARIMA(TOTAL ~ pdq(3,0,1) + PDQ(1,1,1, period = 12) + inter),
+    arima_302_111_12 = ARIMA(TOTAL ~ pdq(3,0,2) + PDQ(1,1,1, period = 12) + inter),
+    arima_203_111_12 = ARIMA(TOTAL ~ pdq(2,0,3) + PDQ(1,1,1, period = 12) + inter),
+    arima_303_111_12 = ARIMA(TOTAL ~ pdq(3,0,3) + PDQ(1,1,1, period = 12) + inter),
+    
+    arima_004_111_12 = ARIMA(TOTAL ~ pdq(0,0,4) + PDQ(1,1,1, period = 12) + inter),
+    arima_104_111_12 = ARIMA(TOTAL ~ pdq(1,0,4) + PDQ(1,1,1, period = 12) + inter),
+    arima_204_111_12 = ARIMA(TOTAL ~ pdq(2,0,4) + PDQ(1,1,1, period = 12) + inter),
+    arima_304_111_12 = ARIMA(TOTAL ~ pdq(3,0,4) + PDQ(1,1,1, period = 12) + inter)
+  )
+
+ocu_plag_inter_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+(intox_ocu_arima_table <- glance(ocu_plag_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ) %>% 
+  slice(-1))
+
+intox_ocu_arima_int_gt <- intox_ocu_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+intox_ocu_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "5.4.Ocupacionales_arima_int.rtf"))
+intox_ocu_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "5.4.Ocupacionales_arima_int.tex"))
+
+ocu_plag_inter_sel_model <- ocu_plag_inter_model |>
+  select(arima_100_011_12)
+
+ocu_plag_inter_sel_model |>
+  report() 
+
+ocu_inter_arima_gt <- ocu_plag_inter_sel_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "inter" ~ "Intervención",
+      term == "intercept" ~ "Intercepto",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+ocu_inter_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "5.5.Ocupacionales_arima_int_mod.rtf"))
+ocu_inter_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "5.5.Ocupacionales_arima_int_mod.tex"))
+
+ocu_plag_inter_sel_model |> 
+  gg_tsresiduals(lag=timeperiod)
+
+png(filename = file.path(img_folder, "5.4.Ocupacional_int_resids.png"),
+    width = 720, height = 480, units = "px")
+ocu_plag_inter_sel_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+```
+  
+##### Verificación de Supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(ocu_plag_inter_lb <- augment(ocu_plag_inter_model) |>
+  filter(.model == "arima_100_011_12") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 2))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+  
+###### Raíces Unitarias  
+  
+```{r}
+png(filename = file.path(img_folder, "5.4.Ocupacional_int_roots.png"),
+    width = 720, height = 480, units = "px")
+ocu_plag_inter_sel_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+  
+###### Normalidad de los residuos  
+  
+```{r}
+# Normalidad de Residuos - ARIMA
+ocu_plag_inter_ts_residuals <- residuals(ocu_plag_inter_sel_model, 
+                                    type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(ocu_plag_inter_ts_residuals)
+
+(ocu_plag_inter_jb_arima <- tseries::jarque.bera.test(ocu_plag_inter_ts_residuals))
+
+(ocu_plag_inter_shap_arima <-shapiro.test(ocu_plag_inter_ts_residuals))
+
+car::qqPlot(ocu_plag_inter_ts_residuals)
+
+# Normalidad de residuos - Regresion
+ocu_plag_inter_reg_residuals <- residuals(ocu_plag_inter_sel_model, type = "regression") %>% as_tibble() %>% pull(.resid)
+
+mean(ocu_plag_inter_reg_residuals)
+
+(ocu_plag_inter_shap_reg <- shapiro.test(ocu_plag_inter_reg_residuals))
+
+car::qqPlot(ocu_plag_inter_reg_residuals)
+
+# png(filename = file.path(img_folder, "5.4.Ocupacional_int_res.png"),
+#     width = 720, height = 480, units = "px")
+# residuals(ocu_plag_inter_sel_model,  type = "innovation") %>% 
+#   gg_tsdisplay(.resid,
+#                plot_type='partial', lag=36)  +
+#   ylab("Residuales")
+# dev.off()
+
+# Visualizacion ambos graficos
+bind_rows(
+    `Regression residuals` =
+        as_tibble(residuals(ocu_plag_inter_sel_model, type = "regression")),
+    `ARIMA residuals` =
+        as_tibble(residuals(ocu_plag_inter_sel_model, type = "innovation")),
+    .id = "type"
+  ) |>
+  mutate(
+    TIEMPO = as_date(TIEMPO)
+  ) |>
+  ggplot(aes(x = TIEMPO, y = .resid)) +
+  geom_line() +
+  facet_grid(vars(type))
+```
+  
+##### Agrupación de resultados  
+  
+```{r}
+(summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Ocupacional por Plaguicidas",
+    Población = "Hombres mayores de 15 años",
+    Enfoque = "Intervención",
+    Modelo = "Regresión con ARIMA (1,0,0)(0,1,1)[12]",
+    # Significancia_intervencion = "No",
+    # ACF_Residuales = "Todos dentro",
+    # Histograma = "Aproximadamente Normal",
+    Residuales_LJung_Box_Test_ARIMA = round(ocu_plag_inter_lb$lb_pvalue, 2),
+    Residuales_Jarque_Bera_ARIMA = round(ocu_plag_inter_jb_arima$p.value, 2),
+    # Residuales_Shapiro_Test_ARIMA = round(ocu_plag_inter_shap_arima$p.value, 2)
+    Residuals_Shapiro_Test_Regression = round(ocu_plag_inter_shap_reg$p.value, 2)
+  )))
+```        
+  
+#### ARIMA - Enfoque Pronostico  
+  
+#### Estacionariedad y Autocorrelogramas Pronóstico   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+ocu_plag_train %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+ocu_plag_train |>
+  features(TOTAL, unitroot_nsdiffs)
+
+ocu_plag_train |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+ocu_plag_train |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+ocu_plag_train |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+ocu_plag_train |>
+  gg_tsdisplay(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+png(filename = file.path(img_folder, "5.5.Ocupacional_pron_dif.png"),
+    width = 720, height = 480, units = "px")
+ocu_plag_train |>
+  gg_tsdisplay(difference(TOTAL, 12),
+               plot_type='partial', lag=36) +
+  ylab("Total Diferenciado (12)")
+dev.off()
+```    
+  
+#### Modelaje Pronóstico     
+  
+##### Selección del Modelo  
+  
+```{r}
+# ocu_plag_pron_model <- ocu_plag_train %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE))
+# 
+# ocu_plag_pron_model |>
+#   pivot_longer(everything(),
+#                names_to = "Model name",
+#                values_to = "Orders")
+
+ocu_plag_pron_model <- ocu_plag_train %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_100_011_12_auto = ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE),
+    arima_000 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,0,0)),
+    arima_001 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,0,0)),
+    arima_100 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,0,0)),
+    arima_101 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,0,0)),
+    arima_002 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(0,0,0)),
+    arima_102 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(0,0,0)),
+
+    arima_003 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(0,0,0)),
+    arima_103 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(0,0,0)),
+
+    arima_000_010_12 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,1,0, period = 12)),
+    arima_001_010_12 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,1,0, period = 12)),
+    arima_100_010_12 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,1,0, period = 12)),
+    arima_101_010_12 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,1,0, period = 12)),
+    arima_002_010_12 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(0,1,0, period = 12)),
+    arima_102_010_12 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(0,1,0, period = 12)),
+
+    arima_003_010_12 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(0,1,0, period = 12)),
+    arima_103_010_12 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(0,1,0, period = 12)),
+
+    arima_000_110_12 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(1,1,0, period = 12)),
+    arima_001_110_12 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(1,1,0, period = 12)),
+    arima_100_110_12 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(1,1,0, period = 12)),
+    arima_101_110_12 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(1,1,0, period = 12)),
+    arima_002_110_12 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(1,1,0, period = 12)),
+    arima_102_110_12 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(1,1,0, period = 12)),
+
+    arima_003_110_12 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(1,1,0, period = 12)),
+    arima_103_110_12 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(1,1,0, period = 12)),
+    
+    arima_000_011_12 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,1,1, period = 12)),
+    arima_001_011_12 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,1,1, period = 12)),
+    arima_100_011_12 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,1,1, period = 12)),
+    arima_101_011_12 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,1,1, period = 12)),
+    arima_002_011_12 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(0,1,1, period = 12)),
+    arima_102_011_12 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(0,1,1, period = 12)),
+    
+    arima_003_011_12 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(0,1,1, period = 12)),
+    arima_103_011_12 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(0,1,1, period = 12)),
+    
+    arima_000_111_12 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(1,1,1, period = 12)),
+    arima_001_111_12 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(1,1,1, period = 12)),
+    arima_100_111_12 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(1,1,1, period = 12)),
+    arima_101_111_12 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(1,1,1, period = 12)),
+    arima_002_111_12 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(1,1,1, period = 12)),
+    arima_102_111_12 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(1,1,1, period = 12)),
+    
+    arima_003_111_12 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(1,1,1, period = 12)),
+    arima_103_111_12 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(1,1,1, period = 12)),
+    
+    
+    # arima_000_010_3 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,1,0, period = 3)),
+    # arima_001_010_3 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,1,0, period = 3)),
+    # arima_100_010_3 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,1,0, period = 3)),
+    # arima_101_010_3 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,1,0, period = 3)),
+    # arima_002_010_3 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(0,1,0, period = 3)),
+    # arima_102_010_3 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(0,1,0, period = 3)),
+    # 
+    # arima_003_010_3 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(0,1,0, period = 3)),
+    # arima_103_010_3 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(0,1,0, period = 3)),
+    # 
+    # arima_000_110_3 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(1,1,0, period = 3)),
+    # arima_001_110_3 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(1,1,0, period = 3)),
+    # arima_100_110_3 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(1,1,0, period = 3)),
+    # arima_101_110_3 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(1,1,0, period = 3)),
+    # arima_002_110_3 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(1,1,0, period = 3)),
+    # arima_102_110_3 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(1,1,0, period = 3)),
+    # 
+    # arima_003_110_3 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(1,1,0, period = 3)),
+    # arima_103_110_3 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(1,1,0, period = 3)),
+    # 
+    # arima_000_011_3 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,1,1, period = 3)),
+    # arima_001_011_3 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,1,1, period = 3)),
+    # arima_100_011_3 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,1,1, period = 3)),
+    # arima_101_011_3 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,1,1, period = 3)),
+    # arima_002_011_3 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(0,1,1, period = 3)),
+    # arima_102_011_3 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(0,1,1, period = 3)),
+    # 
+    # arima_003_011_3 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(0,1,1, period = 3)),
+    # arima_103_011_3 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(0,1,1, period = 3)),
+    # 
+    # arima_000_111_3 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(1,1,1, period = 3)),
+    # arima_001_111_3 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(1,1,1, period = 3)),
+    # arima_100_111_3 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(1,1,1, period = 3)),
+    # arima_101_111_3 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(1,1,1, period = 3)),
+    # arima_002_111_3 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(1,1,1, period = 3)),
+    # arima_102_111_3 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(1,1,1, period = 3)),
+    # 
+    # arima_003_111_3 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(1,1,1, period = 3)),
+    # arima_103_111_3 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(1,1,1, period = 3))
+  )
+
+ocu_plag_pron_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(ocu_plag_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(intox_ocu_pron_arima_table <- glance(ocu_plag_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ) %>% 
+  slice(-1))
+
+intox_ocu_arima_pron_gt <- intox_ocu_pron_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+intox_ocu_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "5.6.Ocupacionales_arima_pron.rtf"))
+intox_ocu_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "5.6.Ocupacionales_arima_pron.tex"))
+
+ocu_plag_final_arima_model <- ocu_plag_pron_model |>
+  select(arima_100_011_12_auto) 
+
+ocu_plag_final_arima_model |>
+  report()
+
+ocu_pron_arima_gt <- ocu_plag_final_arima_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "constant" ~ "Constante",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+ocu_pron_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "5.7.Ocupacionales_arima_pron_mod.rtf"))
+ocu_pron_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "5.7.Ocupacionales_arima_pron_mod.tex"))
+
+png(filename = file.path(img_folder, "5.6.Ocupacional_pron_resids.png"),
+    width = 720, height = 480, units = "px")
+ocu_plag_final_arima_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+```
+  
+##### Verificación de supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(ocu_plag_lb <-  augment(ocu_plag_pron_model) |>
+  filter(.model == "arima_100_011_12_auto") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 2))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+   
+###### Raíces Unitarias
+   
+```{r}
+png(filename = file.path(img_folder, "5.6.Ocupacional_pron_roots.png"),
+    width = 720, height = 480, units = "px")
+ocu_plag_final_arima_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+   
+###### Normalidad de los residuos   
+   
+```{r}
+# Normalidad de Residuos - ARIMA
+ocu_plag_residuals <- residuals(ocu_plag_final_arima_model, type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(ocu_plag_residuals)
+
+(ocu_plag_jb_arima <- tseries::jarque.bera.test(ocu_plag_residuals))
+
+(ocu_plag_shap_arima <- shapiro.test(ocu_plag_residuals))
+
+car::qqPlot(ocu_plag_residuals)
+```
+   
+##### Agrupación de Resultados   
+   
+```{r}
+ocu_plag_pron <- gen_pronostic_plot2(ocu_plag_train, 
+                                      ocu_plag_test,
+                                      ocu_plag_final_arima_model,
+                                      h_forecast = 34)
+ocu_plag_pron$pron_df <- ocu_plag_pron$pron_df %>% View
+  mutate(
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(ocu_plag_pron$pron_df$out)
+ocu_plag_pron$pron_df$ds[ocu_plag_pron$pron_df$out == 1]
+
+ocu_plag_arima_sel_df <- forecast::accuracy(ocu_plag_pron$pron_df$yhat,
+                                                    ocu_plag_pron$pron_df$y) %>%
+  as_tibble() %>% 
+  mutate(Modelo = "ARIMA (1,0,0)(0,1,1)[12]",
+         Metric_Type = "Test set")
+
+summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Ocupacional por Plaguicidas",
+    Población = "Hombres mayores de 15 años",
+    Enfoque = "Pronóstico",
+    Modelo = "ARIMA (1,0,0)(0,1,1)[12]",
+    # ACF_Residuales = "Todos dentro",
+    # Histograma = "Aproximadamente Normal",
+    Residuales_LJung_Box_Test_ARIMA = round(ocu_plag_lb$lb_pvalue, 2),
+    Residuales_Jarque_Bera_ARIMA = round(ocu_plag_jb_arima$p.value, 2)
+    # Residuals_Shapiro_Test_ARIMA = round(ocu_plag_shap_arima$p.value, 2)
+  ))
+```
+  
+#### Prophet - Enfoque Pronóstico
+  
+```{r}
+# ocu_plag_prophet_mod <- generate_prophet_forecast(ocu_plag_train,
+#                                               ocu_plag_test,
+#                                               periods = 34)
+# write_rds(ocu_plag_prophet_mod, "modelos/ocu_plag_prophet.RDS")
+ocu_plag_prophet <- readRDS("modelos/ocu_plag_prophet.RDS")
+
+ocu_plag_prophet$acc_consolidated %>%
+  mutate(model = 1:nrow(ocu_plag_prophet$acc_consolidated)) %>% 
+  arrange(RMSE, MAPE)
+
+ocu_plag_sel_prophet <- 1
+
+ocu_plag_forecast_tb <- ocu_plag_prophet$forecast_tb_list[[ocu_plag_sel_prophet]] %>% 
+  mutate(
+    y = ocu_plag_pron$pron_df$y,
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(ocu_plag_forecast_tb$out)
+ocu_plag_forecast_tb$ds[ocu_plag_forecast_tb$out == 1]
+
+ocu_plag_prophet_plot <- generate_prophet_plot(ocu_plag$ts_train, 
+                      ocu_plag$ts_test, 
+                      forecast_tb = ocu_plag_forecast_tb)
+
+(intox_ocu_both_metrics <- combine_model_metrics(ocu_plag_arima_sel_df, 
+                      ocu_plag_prophet$acc_consolidated[ocu_plag_sel_prophet,]) %>% 
+    mutate_if(is.numeric, ~round(., 2)) %>% 
+    select(Modelo, RMSE, MAPE) %>% 
+  arrange(RMSE, MAPE))
+
+
+intox_ocu_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "5.8.Ocupacionales_proph_arima.rtf"))
+intox_ocu_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "5.8.Ocupacionales_proph_arima.tex"))
+```  
+  
+#### Gráficos de pronóstico
+  
+```{r}
+library(cowplot)
+ocu_plag_plots_aligned  <- align_plots(ocu_plag_pron$arima_plot + theme(legend.position = "none")  + ggtitle('ARIMA (1,0,0)(0,1,1)[12]'), 
+                     ocu_plag_prophet_plot + theme(legend.position = "none")  + ggtitle('Prophet'),
+                     align = 'v', 
+                     axis = 'l')
+
+ocu_arima_legend <- get_legend(ocu_plag_pron$arima_plot)
+
+(ocu_plag_final_plot <- cowplot::plot_grid(ocu_plag_plots_aligned[[1]], 
+                   ocu_plag_plots_aligned[[2]], 
+                  ocu_arima_legend, 
+                  label_size = 10,
+                  rel_heights =  c(1, 1, .1),
+                  nrow = 3))
+
+png(filename = file.path(img_folder, "5.7.Ocupacional_pron_final.png"),
+    width = 720, height = 520, units = "px")
+ocu_plag_final_plot
+dev.off()
+```  
+  
+```{r}
+ocu_supuesto_resi <- summary_arima_mods %>% 
+  gt::gt()
+
+ocu_supuesto_resi %>% 
+  gt::gtsave(file.path(tab_folder, "5.8.Ocupacionales_arima_sups.rtf"))
+ocu_supuesto_resi %>% 
+  gt::gtsave(file.path(tab_folder, "5.8.Ocupacionales_arima_sups.tex"))
+```
+    

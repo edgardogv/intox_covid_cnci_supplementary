@@ -1,0 +1,1209 @@
+---
+title: "Análisis de los casos de intoxicación reportados al CNCI durante el período de COVID-19 entre los años 2020 y 2022."
+author: "Edgardo Gutiérrez Vega"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    downcute_theme: "chaos"
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(cache = TRUE)
+options(scipen = 99)
+```
+
+# Carga, limpieza y procesamiento de datos
+
+## Carga de Datos  
+
+Este procedimiento carga los datos de todos los archivos para los datos de 2015 a 2022.
+
+```{r warning=FALSE, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(gtsummary)
+library(sf)
+library(FactoMineR)
+library(factoextra)
+source("R/tibl_to_ts.R")
+source("R/ggplot_ts.R")
+source("R/plot_map.R")
+source("R/get_ts_from_agg_df.R")
+source("R/get_arima_model.R")
+source("R/get_change_points.R")
+source("R/generate_counts.R")
+source("R/generate_counts_v2.R")
+source("R/analisis_correspondencia.R")
+source("R/get_cumulative_frequencies.R")
+
+fig_count <- 1
+table_count <- 1
+rds_folder <- "rds_results"
+img_folder <- "0.documento_final/img_finales"
+tab_folder <- "0.documento_final/tab_finales"
+fig_list <- list()
+
+key_columns <- readxl::read_excel("Clave Columnas.xlsx")
+colnames(key_columns) <- ifelse(is.na(as.numeric(colnames(key_columns))),
+                                colnames(key_columns),
+                                paste0("A", colnames(key_columns)))
+cnci_files <- list.files("Datos CNCI", full.names = T)
+list_names <- stringr::str_extract_all(cnci_files, "[[:digit:]]+") %>% unlist
+cnci_data <- lapply(cnci_files, function(file) readxl::read_excel(file, skip = 1,
+                                                                 col_types = "text" ))
+names(cnci_data) <- paste0("A", list_names)
+
+## Arreglando año 2016
+cnci_data$A2016 <- cnci_data$A2016 %>% 
+  mutate(
+    Causa = case_when(
+      is.na(Causa) ~ Cuasa,
+      TRUE ~ Causa
+    )
+  )
+```
+  
+## Estandarización de nombre de columnas  
+  
+Esta primera porción toma las claves establecidas y estandariza los nombres de columna por cada tabla.  
+  
+```{r warning=FALSE, message=FALSE}
+std_cols_data <- map(names(cnci_data), function(dataset_name) {
+  selected_keys <- key_columns %>% 
+    select(ESTANDAR, !!dataset_name) %>% 
+    drop_na()
+  
+  selected_set <- selected_keys %>% 
+    pull(!!dataset_name)
+  names(selected_set) <- selected_keys$ESTANDAR
+  
+  std_cols_cnci <- cnci_data[[dataset_name]] %>%
+    select(any_of(!!selected_set))
+  
+  return(std_cols_cnci)
+})
+names(std_cols_data) <- names(cnci_data)
+```
+  
+## Filtrado de datos  
+  
+En esta porción se excluyen las intoxicaciones de tipo animal. Se incluyen solamentes las marcadas como intoxicación y se excluyen las asesorías.  
+  
+```{r warning=FALSE, message=FALSE}
+filtrd_data <- lapply(std_cols_data, function(data) {
+  # if ("COLECTIVA" %in% col   names(data)) {
+  #   data <- data %>%
+  #     filter(COLECTIVA != 1 |
+  #              is.na(COLECTIVA))
+  # }
+  
+  if ("TIPO_INTOX" %in% colnames(data)) {
+    data <- data %>%
+      filter(grepl("humano", tolower(TIPO_INTOX)))
+  }
+  
+  data <- data %>%
+    filter(grepl("si", tolower(INTOXICACION)),
+           !grepl("Extranjero", CANTON))
+  
+  return(data)
+})
+```
+  
+## Limpieza de columnas  
+  
+Se deja por por fuera cualquier columna que no esté incluida en el conjunto de claves.  
+  
+
+```{r warning=FALSE, message=FALSE}
+nona_keys <- key_columns %>% 
+  drop_na()
+
+ready_data <- lapply(filtrd_data, function(data) {
+  ready_dataset <- data %>% 
+    select(any_of(!!nona_keys$ESTANDAR))
+  
+  return(ready_dataset)
+})
+```
+
+## Inclusión de segmentos según pandemia
+
+Se agrega la variable PERIODO para diferenciar algunos segmentos del período pandémico tal como: pre-pandemia, pandemia, y vacunación.
+
+```{r warning=FALSE, message=FALSE}
+inicio_pandemia <- "2020-03-01"
+inicio_tercera_ola <- "2021-03-01"
+inicio_cuarta_ola <- "2021-12-01"
+inicio_vacunacion <- "2021-01-01"
+#https://delfino.cr/2021/04/costa-rica-acumula-1-millon-de-dosis-de-vacuna-contra-covid-19-recibidas-mas-de-la-mitad-se-han-aplicado
+
+integrated_data <- bind_rows(ready_data, .id = "YEAR") %>% 
+  mutate(YEAR = as.numeric(str_remove(YEAR, "A"))) %>% 
+  mutate(EDAD_A = as.numeric(EDAD_A)) %>% 
+  mutate(EDAD_M = as.numeric(EDAD_M)) %>% 
+  mutate(EDAD_D = as.numeric(EDAD_D)) %>% 
+  mutate(YEAR = str_replace(YEAR, "A", "")) %>% 
+  mutate(FECHA = as.numeric(FECHA)) %>% 
+  mutate(HORA = as.numeric(HORA)) %>% 
+  mutate(HORA = as.POSIXct((FECHA + HORA) * (60*60*24), origin="1899-12-30", tz="GMT")) %>% 
+  mutate(FECHA = as.Date(FECHA, origin="1899-12-30")) %>% 
+  mutate(
+    PERIODO = case_when(
+      FECHA < as_date(inicio_pandemia) ~ "Pre-Pandémico",
+      FECHA >= as_date(inicio_pandemia) & FECHA < as_date(inicio_vacunacion) ~ "Pandemia",
+      FECHA >= as_date(inicio_vacunacion) ~ "Pandemia y Vacunación"
+    ),
+    PERIODO = factor(PERIODO, levels = c("Pre-Pandémico", "Pandemia", "Pandemia y Vacunación"))
+  ) %>% 
+  mutate(TIEMPO = paste0(YEAR, "-", month(FECHA), "-01") %>% as_date) 
+
+```
+
+## Estandarización de categorías
+
+Algunos nombres de categorías difieren ligeramente por año en su formato, por lo que se deben estandarizar para poder realizar el análisis correctamente.
+
+Se usaron solo los primeros 5 niveles de importancia para los toxicos.
+
+Se utilizaron las fechas como las fechas de exposicion, debido a la ausencia de muchos valores en la columna de fecha de exposicion.
+
+```{r warning=FALSE, message=FALSE}
+integrated_data2 <- integrated_data %>%
+  mutate(
+    # Modificación de Cantón
+    # CANTON = str_replace_all(CANTON, "á", "a"),
+    # CANTON = str_replace_all(CANTON, "é", "e"),
+    # CANTON = str_replace_all(CANTON, "í", "i"),
+    # CANTON = str_replace_all(CANTON, "ó", "o"),
+    # CANTON = str_replace_all(CANTON, "ú", "u"),
+    # Modificación de Causa
+    CAUSA = str_replace_all(CAUSA, "á", "a"),
+    CAUSA = str_replace_all(CAUSA, "é", "e"),
+    CAUSA = str_replace_all(CAUSA, "í", "i"),
+    CAUSA = str_replace_all(CAUSA, "ó", "o"),
+    CAUSA = str_replace_all(CAUSA, "ú", "u"),
+    # Modificación de CODTOX1
+    CODTOX1 = str_replace_all(CODTOX1, "á", "a"),
+    CODTOX1 = str_replace_all(CODTOX1, "é", "e"),
+    CODTOX1 = str_replace_all(CODTOX1, "í", "i"),
+    CODTOX1 = str_replace_all(CODTOX1, "ó", "o"),
+    CODTOX1 = str_replace_all(CODTOX1, "ú", "u"),
+    CODTOX1 = case_when(
+      str_detect(CODTOX1, "13\\.") ~ "13.Abuso",
+      str_detect(CODTOX1, "17\\.") ~ "17.Plantas",
+      TRUE ~ CODTOX1
+    ),
+    # Modificación de CODTOX2
+    CODTOX2 = str_replace_all(CODTOX2, "á", "a"),
+    CODTOX2 = str_replace_all(CODTOX2, "é", "e"),
+    CODTOX2 = str_replace_all(CODTOX2, "í", "i"),
+    CODTOX2 = str_replace_all(CODTOX2, "ó", "o"),
+    CODTOX2 = str_replace_all(CODTOX2, "ú", "u"),
+    CODTOX2 = case_when(
+      str_detect(CODTOX2, "13\\.") ~ "13.Abuso",
+      str_detect(CODTOX2, "17\\.") ~ "17.Plantas",
+      TRUE ~ CODTOX2
+    ),
+    # Modificación de CODTOX3
+    CODTOX3 = str_replace_all(CODTOX3, "á", "a"),
+    CODTOX3 = str_replace_all(CODTOX3, "é", "e"),
+    CODTOX3 = str_replace_all(CODTOX3, "í", "i"),
+    CODTOX3 = str_replace_all(CODTOX3, "ó", "o"),
+    CODTOX3 = str_replace_all(CODTOX3, "ú", "u"),
+    CODTOX3 = case_when(
+      str_detect(CODTOX3, "13\\.") ~ "13.Abuso",
+      str_detect(CODTOX3, "17\\.") ~ "17.Plantas",
+      TRUE ~ CODTOX3
+    ),
+    # Modificación de CODTOX4
+    CODTOX4 = str_replace_all(CODTOX4, "á", "a"),
+    CODTOX4 = str_replace_all(CODTOX4, "é", "e"),
+    CODTOX4 = str_replace_all(CODTOX4, "í", "i"),
+    CODTOX4 = str_replace_all(CODTOX4, "ó", "o"),
+    CODTOX4 = str_replace_all(CODTOX4, "ú", "u"),
+    CODTOX4 = case_when(
+      str_detect(CODTOX4, "13\\.") ~ "13.Abuso",
+      str_detect(CODTOX4, "17\\.") ~ "17.Plantas",
+      TRUE ~ CODTOX4
+    ),
+    # Modificación de CODTOX5
+    CODTOX5 = str_replace_all(CODTOX5, "á", "a"),
+    CODTOX5 = str_replace_all(CODTOX5, "é", "e"),
+    CODTOX5 = str_replace_all(CODTOX5, "í", "i"),
+    CODTOX5 = str_replace_all(CODTOX5, "ó", "o"),
+    CODTOX5 = str_replace_all(CODTOX5, "ú", "u"),
+    CODTOX5 = case_when(
+      str_detect(CODTOX5, "13\\.") ~ "13.Abuso",
+      str_detect(CODTOX5, "17\\.") ~ "17.Plantas",
+      TRUE ~ CODTOX5
+    ),
+    # Modificando Edad
+    EDAD_A = case_when(
+      YEAR < 2018 & EDAD_A == 99 ~ -1,
+      TRUE ~ EDAD_A
+    ),
+    # Modificando Ruta
+    RUTA = str_replace_all(RUTA, "á", "a"),
+    RUTA = str_replace_all(RUTA, "é", "e"),
+    RUTA = str_replace_all(RUTA, "í", "i"),
+    RUTA = str_replace_all(RUTA, "ó", "o"),
+    RUTA = str_replace_all(RUTA, "ú", "u"),
+    # Modificando sexo
+    SEXO = case_when(
+      str_detect(tolower(SEXO), "fem") ~ "Femenino",
+      str_detect(tolower(SEXO), "masc") ~ "Masculino",
+      TRUE ~ "No Anotado"
+    ),
+    # Modificando la clase 68 de clasifarmas
+    CLASIFARMA1 = case_when(
+      str_detect(CLASIFARMA1, "68") ~ "68.Macrobioticos y productos naturales",
+      TRUE ~ CLASIFARMA1
+    ),
+    CLASIFARMA2 = case_when(
+      str_detect(CLASIFARMA2, "68") ~ "68.Macrobioticos y productos naturales",
+      TRUE ~ CLASIFARMA2
+    ),
+    CLASIFARMA3 = case_when(
+      str_detect(CLASIFARMA3, "68") ~ "68.Macrobioticos y productos naturales",
+      TRUE ~ CLASIFARMA3
+    ),
+    CLASIFARMA4 = case_when(
+      str_detect(CLASIFARMA4, "68") ~ "68.Macrobioticos y productos naturales",
+      TRUE ~ CLASIFARMA4
+    ),
+    CLASIFARMA5 = case_when(
+      str_detect(CLASIFARMA5, "68") ~ "68.Macrobioticos y productos naturales",
+      TRUE ~ CLASIFARMA5
+    ),
+    # Modificando la clases duplicadasde plaguicidas
+    CLASIPLAG1 = case_when(
+      str_detect(CLASIPLAG1, "39") ~ "39.Fungicida de manejo general",
+      str_detect(CLASIPLAG1, "40") ~ "40.Fun.Derivados de estrobilurina",
+      str_detect(CLASIPLAG1, "49") ~ "49.Herbicidas Tiadiazinas",
+      TRUE ~ CLASIPLAG1
+    ),
+    CLASIPLAG2 = case_when(
+      str_detect(CLASIPLAG2, "39") ~ "39.Fungicida de manejo general",
+      str_detect(CLASIPLAG2, "40") ~ "40.Fun.Derivados de estrobilurina",
+      str_detect(CLASIPLAG2, "49") ~ "49.Herbicidas Tiadiazinas",
+      TRUE ~ CLASIPLAG2
+    ),
+    CLASIPLAG3 = case_when(
+      str_detect(CLASIPLAG3, "39") ~ "39.Fungicida de manejo general",
+      str_detect(CLASIPLAG3, "40") ~ "40.Fun.Derivados de estrobilurina",
+      str_detect(CLASIPLAG3, "49") ~ "49.Herbicidas Tiadiazinas",
+      TRUE ~ CLASIPLAG3
+    )
+  )
+```
+
+## Creando categorías de interés
+
+Esta porcion de código crea algunos grupos de interés como el Grupo Etario y una agrupación más generalizada del código de tóxico principal.
+
+```{r warning=FALSE, message=FALSE}
+serpientes_interes <- c("BECQUER", "BOA", "BOCARACA", "CASCABEL", "CORAL","LORA", "MANO PIEDRA", "MATABUEY", "OROPEL", "PITON", "RABO AMARILLO", "SERPIENTES DESCONOCIDAS", "TAMAGA", "TERCIOPELO", "TOBOBA")
+
+limpieza_interes <- c("DESINFECTANTES", "LIMPIADORES MULTIUSOS", "HIPOCLORITO DE SODIO", "ACIDO CLORHIDRICO", "ACIDO ACETICO", "AGUA OXIGENADA", "DETERGENTES", "DETERGENTE LIQUIDO", "ALCOHOL ETILICO", "HIDROXIDO DE SODIO", "ALCOHOL GEL", "LIMPIADORES MULTIUSOS")
+
+vacunas_covid <- c("VACUNA COVID PFIZER", "VACUNA COVID ASTRAZENECA", "VACUNA COVID MODERNA", "VACUNA COVID JOHNSON & JOHNSON")
+
+spec_toxicos_interes <- c("LICOR", "MARIHUANA", "COCAINA", "CLONAZEPAM", "ACETAMINOFEN", "HIPOCLORITO DE SODIO")
+
+clasifarmas <- unique(integrated_data2$CLASIFARMA1 %>% na.omit) %>% sort
+
+meds_df <- integrated_data2 %>% 
+  filter(
+    CODTOX1 == "01.Medicamentos"
+  )
+toxis <- unique(meds_df$TOXICO1)
+
+integrated_data3 <- integrated_data2
+missing_tox <- c()
+dup_max_tox <- c()
+for (tox in toxis) {
+  temp_df <- integrated_data3 %>% 
+    filter(
+      TOXICO1 == tox
+    )
+  cf <- table(temp_df$CLASIFARMA1) %>% sort()
+  if (length(cf) == 0) {
+    missing_tox <- c(missing_tox, tox)
+    next
+  }
+  most_common_cf <- names(cf[cf == max(cf)])
+  if (length(most_common_cf) > 1) {
+    dup_max_tox <- c(dup_max_tox, tox)
+    most_common_cf <- most_common_cf[1]
+  }
+    integrated_data3 <- integrated_data3 %>% 
+      mutate(
+        CLASIFARMA1 = case_when(
+          TOXICO1 == tox ~ most_common_cf,
+          TRUE ~ CLASIFARMA1
+        )
+      )
+}
+
+cat(paste("Los siguientes tóxicos no tienen una clasificación farmacológica identificada en los datos del 2015 al 2022:", paste(missing_tox, collapse = ", ")))
+
+cat(paste("Los siguientes tóxicos tienen más de una clasificación farmacológica posible identificada con la misma cantidad de casos en los datos del 2015 al 2022:", paste(dup_max_tox, collapse = ", ")))
+
+integrated_data4 <- integrated_data3 %>% 
+  filter(
+    SEXO != "No Anotado"
+  ) %>% 
+  mutate(
+    GRUPO_ETARIO = case_when(
+      EDAD_A < 5 & EDAD_A >= 0 ~ "0 a 4 años",
+      EDAD_A >= 5 & EDAD_A < 10 ~ "05 a 9 años",
+      EDAD_A >= 10 & EDAD_A < 15 ~ "10 a 14 años",
+      EDAD_A >= 15 & EDAD_A < 20 ~ "15 a 19 años",
+      EDAD_A >= 20 & EDAD_A < 25 ~ "20 a 24 años",
+      EDAD_A >= 25 & EDAD_A < 30 ~ "25 a 29 años",
+      EDAD_A >= 30 & EDAD_A < 35 ~ "30 a 34 años",
+      EDAD_A >= 35 & EDAD_A < 40 ~ "35 a 39 años",
+      EDAD_A >= 40 & EDAD_A < 45 ~ "40 a 44 años",
+      EDAD_A >= 45 & EDAD_A < 50 ~ "45 a 49 años",
+      EDAD_A >= 50 & EDAD_A < 55 ~ "50 a 54 años",
+      EDAD_A >= 55 & EDAD_A < 60 ~ "55 a 59 años",
+      EDAD_A >= 60 & EDAD_A < 65 ~ "60 a 64 años",
+      EDAD_A >= 65 & EDAD_A < 70 ~ "65 a 69 años",
+      EDAD_A >= 70 & EDAD_A < 75 ~ "70 a 74 años",
+      EDAD_A >= 75 ~ "Mayor a 75 años",
+      TRUE ~ "No Anotado"
+    ),
+    PROV_CANTON = paste(PROVINCIA, "-", CANTON),
+    CCANTON = CANTON,
+    CANTON = str_remove_all(CANTON, "[[:digit:]]+\\."),
+    SPEC_TOXICO_INTERES = case_when(
+      TOXICO1 %in% spec_toxicos_interes ~ TOXICO1,
+      TRUE ~ "OTRO"
+    ),
+    CAUSA_INTERES = dplyr::case_when(
+      CAUSA == "01.Accidental" ~ "Accidental",
+      CAUSA == "03.Adiccion" ~ "Adicción",
+      CAUSA %in% c("13.Rxn.adversa medicamentos", "06.Automedicacion", 
+                   "08.Errores de medicacion") ~ "Reacción adversa a medicamentos, Errores y Automedicación",
+      CAUSA == "18.Tentativa de suicidio" ~ "Tentativa de suicidio",
+      CAUSA == "19.Ocupacional" ~ "Ocupacional",
+      CAUSA %in%c("04.Alimentaria", "14.Rxn.adversa alimentos") ~ "Alimentaria",
+      !CAUSA %in% c("01.Accidental", "03.Adiccion", "13.Rxn.adversa medicamentos",
+                    "18.Tentativa de suicidio", "19.Ocupacional", "04.Alimentaria",
+                    "06.Automedicacion", "14.Rxn.adversa alimentos",
+                    "08.Errores de medicacion") ~ "Otras"
+    ), 
+    TOXICO_INTERES1 = dplyr::case_when(
+      CODTOX1 == "14.Alimentos y bebidas" ~ "Alimentos y bebidas",
+      CLASIFARMA1 == "14.AINES, antirrematicos y agentes mineralizantes" ~ "Medicamentos para el dolor",
+      CLASIFARMA1 == "16.Analgesicos no narcoticos" ~ "Medicamentos para el dolor",
+      CLASIFARMA1 == "17.Analgesicos narcoticos y antagonistas" ~ "Analgesicos Narcoticos",
+      CLASIFARMA1 == "28.Anticonvulsivos" ~ "Anticonvulsivos",
+      CLASIFARMA1 == "29.Antidepresivos y psicoestimulantes" ~ "Antidepresivos y psicoestimulantes",
+      CLASIFARMA1 == "30.Antipsicoticos" ~ "Antipsicoticos",
+      CLASIFARMA1 == "31.Sedantes/hipnoticos, ansioliticos" ~ "Sedantes/hipnoticos, ansioliticos",
+      CLASIFARMA1 == "25.Antihistaminicos, antiemeticos, antipruriticos" ~ "Antihistaminicos, antiemeticos, antipruriticos",
+      CLASIFARMA1 == "02.Antibioticos" ~ "Antibioticos",
+      CLASIFARMA1 == "08.Antihipertensivos" ~ "Antihipertensivos",
+      CLASIFARMA1 == "23.Antiasmaticos y broncodilatadores" ~ "Antiasmaticos y broncodilatadores",
+      CLASIFARMA1 == "24.Antitusigenos, fluidificantes y expectorantes" ~ "Antitusigenos, fluidificantes y expectorantes",
+      str_detect(str_to_lower(CODTOX1), "plaguicidas") ~ "Plaguicidas",
+      str_detect(str_to_lower(CODTOX1), "plantas") ~ "Plantas",
+      TOXICO1 %in% serpientes_interes  ~ "Serpientes",
+      TOXICO1 == "ALACRANES" ~ "Alacranes",
+      TOXICO1 == "AVISPAS" ~ "Avispas",
+      TOXICO1 == "ABEJAS" ~ "Abejas",
+      TOXICO1 %in% limpieza_interes ~ "Productos de Limpieza",
+      TOXICO1 %in% vacunas_covid ~ TOXICO1,
+      CLASIFARMA1 == "44.Biologicos, vacunas, toxoides y antitoxinas" & !TOXICO1 %in% vacunas_covid ~ "Biologicos, vacunas, toxoides y antitoxinas",
+      str_detect(str_to_lower(CODTOX1), "abuso") ~ "Drogas de Abuso",
+      # TOXICO1 == "ACETAMINOFEN" ~ "Medicamentos para el dolor",
+      # TOXICO1 == "CLONAZEPAM" ~ "Sedantes/hipnoticos, ansioliticos",
+      # TOXICO1 == "CARBAMAZEPINA" ~ "Anticonvulsivos",
+      # TOXICO1 == "CLORFENIRAMINA" ~ "Antihistaminicos, antiemeticos, antipruriticos",
+      # TOXICO1 == "IBUPROFENO" ~ "Medicamentos para el dolor",
+      # TOXICO1 == "TRAMADOL" ~ "Analgesicos Narcoticos",
+      # TOXICO1 == "AMOXICILINA" ~ "Antibioticos",
+      # TOXICO1 == "METFORMINA" ~ "Medicamentos para el dolor",
+      CODTOX1 == "03.Quimicos/Comerciales/Industriales" ~ "Quimicos/Comerciales/Industriales",
+      CODTOX1 == "04.Hogar y Recreacion" ~ "Hogar y Recreacion",
+      CODTOX1 == "05.Cosmeticos Uso personal" ~ "Cosmeticos",
+      CODTOX1 == "18.Animales" ~ "Animales",
+      TRUE ~ "Otros"
+    ),
+    TOXICO_INTERES_HL1 = case_when(
+      TOXICO_INTERES1 %in% c( "Antidepresivos y psicoestimulantes", "Sedantes/hipnoticos, ansioliticos", "Antipsicoticos", "Anticonvulsivos", "Analgesicos Narcoticos") ~ "Medicamentos con acción a nivel del SNC",
+      TOXICO_INTERES1 %in% c("Animales", "Abejas", "Avispas", "Alacranes", "Serpientes") ~ "Animales",
+      TRUE ~ TOXICO_INTERES1
+    )
+  )
+
+otros_df <- integrated_data4 %>% 
+  filter(
+    TOXICO_INTERES1 == "Otros"
+  )
+
+cat(paste("La clase Otros equivale a una proporción de", nrow(otros_df)/nrow(integrated_data4)))
+```
+
+## Preprocesamiento Datos del INEC
+
+Se agregó manualmente el cantón de Esparza y la primera columna. El archivo original fue:
+https://admin.inec.cr/sites/default/files/media/repoblacev2011-2025-03_2.xlsx
+
+```{r warning=FALSE, message=FALSE}
+hojas_excel <- readxl::excel_sheets("repoblacev2011-2025-03_2.xlsx")
+datos_inec <- lapply(hojas_excel, function(hoja) {
+  pop_data <- readxl::read_excel("repoblacev2011-2025-03_2.xlsx", 
+                     sheet = hoja, 
+                     col_types = "text",
+                     skip = 6) 
+  
+  pop_data[1,c(1:3)] <- c("Categoria", colnames(pop_data)[2:3]) %>% t()
+  pop_data[1, 4:ncol(pop_data)] <- paste(pop_data[1, 4:ncol(pop_data)], "años") %>% str_replace("-", "a") %>% t()
+  colnames(pop_data) <- pop_data[1, ]
+  pop_data <- pop_data[3:nrow(pop_data), ] 
+  
+  cuts <- which(is.na(pop_data$`Provincia, cantón, distrito y sexo`))
+  
+  gen_pop <- pop_data[1:(cuts[1] - 1), ] %>% 
+    pivot_longer(
+      cols = -colnames(pop_data)[1:2],
+      names_to = "Grupo",
+      values_to = "Poblacion"
+    ) %>% 
+    mutate(
+      Sexo = "Todos"
+    )
+  hombres_pop <- pop_data[(cuts[1] + 1):(cuts[2] - 1), ] %>% 
+    pivot_longer(
+      cols = -colnames(pop_data)[1:2],
+      names_to = "Grupo",
+      values_to = "Poblacion"
+    ) %>% 
+    mutate(
+      Sexo = "Masculino"
+    )
+  mujeres_pop <- pop_data[(cuts[2] + 1):(nrow(pop_data)), ] %>% 
+    pivot_longer(
+      cols = -colnames(pop_data)[1:2],
+      names_to = "Grupo",
+      values_to = "Poblacion"
+    ) %>% 
+    mutate(
+      Sexo = "Femenino"
+    )
+  final_pop_data <- bind_rows(gen_pop, hombres_pop, mujeres_pop) %>% 
+    mutate(
+      Poblacion = as.numeric(Poblacion)
+    ) %>% 
+    filter(
+      !Categoria %in% c("Distrito")
+    )
+  return(final_pop_data)
+})
+names(datos_inec) <- paste0("A", hojas_excel)
+
+datos_pob <- bind_rows(datos_inec, .id = "Year") %>% 
+  mutate(Year = str_remove(Year, "A") %>% as.numeric()) %>% 
+  filter(Year >= 2015,
+         Year <= 2022) %>% 
+  mutate(
+    `Provincia, cantón, distrito y sexo` = case_when(
+      `Provincia, cantón, distrito y sexo` %in% c("Vásquez de Coronado") ~ "Vázquez de Coronado",
+      `Provincia, cantón, distrito y sexo` %in% c("León Cortés") ~ "León Cortés Castro",
+      TRUE ~ `Provincia, cantón, distrito y sexo`
+    )
+  )
+
+# pob_year_pais <- datos_pob %>%
+#   filter(Grupo == "Total",
+#          `Provincia, cantón, distrito y sexo` == "Costa Rica")
+# 
+# pob_year_sexo_pais <- datos_pob %>%
+#   filter(Grupo == "Total",
+#          Sexo %in% c("Masculino", "Femenino"),
+#          Categoria == "Pais")
+
+pob_year_sexo_ge_canton <- datos_pob %>% 
+  filter(Categoria == "Canton",
+         Grupo != "Total",
+         Sexo %in% c("Masculino", "Femenino")) %>% 
+  select(-Categoria)
+```
+  
+### Informacion de cantones
+  
+Cantones: https://hub.arcgis.com/datasets/ebe4e47620924be0a01be4cf5842d0e6_0/explore?location=9.236915%2C-83.713113%2C7.78
+Distritos: https://hub.arcgis.com/datasets/741bdd9fa2ca4d8fbf1c7fe945f8c916_0/explore?location=9.480024%2C-84.500000%2C7.72
+
+```{r}
+cantones_st <- st_read('Cantones_de_Costa_Rica/Cantones_de_Costa_Rica.shp') %>% 
+  suppressWarnings() %>% suppressMessages() %>% drop_na(NAME)
+
+cantones_st$NAME[!cantones_st$NAME %in% integrated_data4$CANTON]
+integrated_data4$CANTON[!integrated_data4$CANTON %in% cantones_st$NAME] %>% unique %>% sort
+
+integrated_data4 <- integrated_data4 %>% 
+  mutate(
+    CANTON = case_when(
+      CANTON %in% c("Coronado", "Vazquez Coronado") ~ "Vázquez de Coronado",
+      CANTON %in% c("Santa Barbara", "Barbara") ~ "Santa Bárbara",
+      CANTON %in% c("Leon Cortes", "León Cortés") ~ "León Cortés Castro",
+      CANTON %in% c("Los chiles") ~ "Los Chiles",
+      CANTON %in% c("Alafro Ruiz", "Alfaro Ruiz") ~ "Zarcero",
+      CANTON %in% c("Aserri") ~ "Aserrí",
+      CANTON %in% c("Belen") ~ "Belén",
+      CANTON %in% c("Canas") ~ "Cañas",
+      CANTON %in% c("Esparaza") ~ "Esparza",
+      CANTON %in% c("Escazu") ~ "Escazú",
+      CANTON %in% c("Guacimo") ~ "Guácimo",
+      CANTON %in% c("La Union") ~ "La Unión",
+      CANTON %in% c("Limon") ~ "Limón",
+      CANTON %in% c("Montes de oro") ~ "Montes de Oro",
+      CANTON %in% c("Monteverde") ~ "Puntarenas",
+      CANTON %in% c("Paraiso") ~ "Paraíso",
+      CANTON %in% c("Perez Zeledon") ~ "Pérez Zeledón",
+      CANTON %in% c("Poas") ~ "Poás",
+      CANTON %in% c("Pococi") ~ "Pococí",
+      CANTON %in% c("Quepos") ~ "Aguirre",
+      CANTON %in% c("Rio Cuarto") ~ "Grecia",
+      CANTON %in% c("San Jose") ~ "San José",
+      CANTON %in% c("San Ramon") ~ "San Ramón",
+      CANTON %in% c("Sarapiqui") ~ "Sarapiquí",
+      CANTON %in% c("Sarchi") ~ "Valverde Vega",
+      CANTON %in% c("Tarrazu") ~ "Tarrazú",
+      CANTON %in% c("Tibas") ~ "Tibás",
+      CANTON %in% c("Tilaran") ~ "Tilarán",
+      CANTON %in% c("Jimenez") ~ "Jiménez",
+      TRUE ~ CANTON
+    )
+  )
+
+cantones_st$NAME[!cantones_st$NAME %in% integrated_data4$CANTON]
+integrated_data4$CANTON[!integrated_data4$CANTON %in% cantones_st$NAME] %>% unique %>% sort
+```  
+  
+## Objetivos  
+  
+### Objetivo General  
+  
+#### Analizar los casos de intoxicación reportados al Centro Nacional para Control de Intoxicaciones de Costa Rica durante el período de COVID-19 entre los años 2020 y 2022 y el período previo entre los años 2015 y 2019, con el fin de explicar el cambio en el reporte de intoxicaciones después del comienzo de la pandemia.  
+  
+### Objetivos Especificos  
+
+#### 1.	Realizar un análisis exploratorio para comparar los casos reportados de intoxicación entre el período pre-COVID-19 (2018 y 2019) y el período COVID-19 (2020 a 2022), tomando en cuenta segmentación según variables demográficas (sexo, grupo etario, lugar del reporte) y características de la intoxicación considerando principalmente medicamentos, plaguicidas, drogas de abuso, sustancias utilizadas en el hogar para limpieza o recreación, animales y plantas.
+  
+#### 2.	Estudiar la relación entre las categorías relevantes que se originen de la segmentación según variables demográficas y características de la intoxicación, para los años 2019, 2020, 2021 y 2022.  
+  
+#### 3.	Determinar si existen desviaciones significativas en los casos reportados de intoxicación en el período COVID-19 (2020 y 2021) con respecto a los casos esperados según una proyección realizada con los casos de intoxicación reportados en los 5 años anteriores al período COVID-19 (2015 a 2019), tomando en cuenta segmentación según variables demográficas (Sexo y Grupo Etario) y toxico principal, específicamente medicamentos, plaguicidas, animales, drogas de abuso, y sustancias usadas para limpieza en el hogar.    
+  
+## Análisis Exploratorio General  
+  
+### Intoxicaciones totales por mes
+
+Los casos totales reportados entre enero 2015 y diciembre 2022 se muestran en la Figura `r fig_count`. Entre enero de 2015 y abril 2019 se muestra un comportamiento estable que oscila alrededor de los 800 casos. Entre mayo 2019 y febrero 2020, se observó un incremento en el reporte de casos que se mantuvo estable y oscilando alrededor de los 1 mil casos. De acuerdo con el CNCI, esto pudo ser debido al efecto de campañas para dar a conocer el trabajo del CNCI y la entrada en vigencia de la línea telefónica 800-Intoxica.
+
+De acuerdo con la misma figura, entre marzo y diciembre del 2020, correspondiente a los primeros 10 meses de la pandemia COVID-19, el reporte de casos presentó un aumento y osciló entre los 1200 casos, pero se observó mayor variabilidad. En el año 2021, cuando empezó la vacunación, se observó un incremento sostenido de reportes desde abril hasta alcanzar un pico de 2148 casos reportados en junio, y luego inició el descenso. Los casos totales reportados parecen haberse estabilizado en el año 2022, donde oscilaron nuevamente alrededor de los 1200 casos.
+
+```{r}
+general_ts <- tibl_to_ts(integrated_data4,
+                date_column = "TIEMPO",
+                grouping_variables = NULL)
+
+data_15_19 <- general_ts$data %>% 
+  filter(TIEMPO < as.Date("2019-05-01"))
+data_19_20 <- general_ts$data %>% 
+  filter(TIEMPO >= as.Date("2019-05-01"),
+         TIEMPO < as.Date("2020-03-01"))
+data_20 <- general_ts$data %>% 
+  filter(TIEMPO >= as.Date("2020-03-01"),
+         TIEMPO < as.Date("2020-12-01"))
+data_21 <- general_ts$data %>% 
+  filter(TIEMPO >= as.Date("2021-01-01"),
+         TIEMPO < as.Date("2021-12-01"))
+data_22 <- general_ts$data %>% 
+  filter(TIEMPO >= as.Date("2022-01-01"),
+         TIEMPO < as.Date("2022-12-01"))
+
+fig_list[[paste0("fig", fig_count)]] <- ggplot_ts(general_ts$data, 
+                                                  x_var = "TIEMPO", 
+                                                  y_var = "TOTAL",
+                                                  x_lab = "Tiempo", 
+                                                  y_lab = "Total de Casos Reportados")
+
+fig_list[[paste0("fig", fig_count)]] 
+fig_list[[paste0("fig", fig_count)]] %>% plotly::ggplotly()
+fig_count <- fig_count + 1
+
+paste("Promedio entre enero 2015 y abril 2019:", mean(data_15_19$TOTAL) %>% round(2))
+paste("Promedio entre mayo 2019 y febrero 2020:", mean(data_19_20$TOTAL) %>% round(2))
+paste("Promedio entre marzo 2020 y diciembre 2020:", mean(data_20$TOTAL) %>% round(2))
+paste("Promedio entre enero 2021 y diciembre 2021:", mean(data_21$TOTAL) %>% round(2))
+paste("Promedio entre enero 2022 y diciembre 2022:", mean(data_22$TOTAL) %>% round(2))
+```
+  
+### Intoxicaciones totales según Período  
+  
+Los casos totales reportados entre enero 2015 y diciembre 2022, separados por periodo, se muestran en la Figura `r fig_count`. Es notable un incremento abrupto durante los primeros meses del período de vacunación.   
+  
+```{r}
+periodo_ts <- tibl_to_ts(integrated_data4,
+                date_column = "TIEMPO",
+                grouping_variables = c("PERIODO"))
+
+fig_list[[paste0("fig", fig_count)]] <- 
+  ggplot_ts(periodo_ts$data %>% filter(TOTAL > 0), 
+          x_var = "TIEMPO", 
+          y_var = "TOTAL",
+          color_var = "PERIODO", 
+          x_lab = "Tiempo", 
+          y_lab = "Total de Casos Reportados",
+          color_lab = "Periodo") 
+
+val_inicio_pandemia <- periodo_ts$data %>% 
+  filter(TIEMPO == inicio_pandemia,
+         PERIODO == "Pandemia") %>% 
+  pull(TOTAL)
+val_inicio_vacunacion <- periodo_ts$data %>% 
+  filter(TIEMPO == inicio_vacunacion,
+         PERIODO == "Pandemia y Vacunación") %>% 
+  pull(TOTAL)  
+
+
+periodo_data_mod <- periodo_ts$data %>% 
+  mutate(
+    TOTAL = case_when(
+      TIEMPO == inicio_pandemia & PERIODO == "Pre-Pandémico" ~ val_inicio_pandemia,
+      TIEMPO == inicio_vacunacion & PERIODO == "Pandemia" ~ val_inicio_vacunacion,
+      TRUE ~ TOTAL
+    )
+  )
+
+png(filename = file.path(img_folder, "1.1.Exploratorio.png"),
+    width = 720, height = 340, units = "px")
+fig_list[[paste0("fig", fig_count)]] 
+dev.off()
+fig_list[[paste0("fig", fig_count)]] %>% plotly::ggplotly()
+fig_count <- fig_count + 1
+
+png(filename = file.path(img_folder, "1.1.1.Exploratorio.png"),
+    width = 720, height = 340, units = "px")
+ggplot_ts(periodo_data_mod %>% filter(TOTAL > 0), 
+          x_var = "TIEMPO", 
+          y_var = "TOTAL",
+          color_var = "PERIODO", 
+          x_lab = "Tiempo", 
+          y_lab = "Total de Casos Reportados",
+          color_lab = "Periodo") 
+dev.off()
+fig_count <- fig_count + 1
+```
+  
+### Intoxicaciones totales según sexo  
+  
+Los casos totales reportados entre enero 2015 y diciembre 2022, separados por sexo, se muestran en la Figura `r fig_count`. Durante todo el período, los casos totales reportados por mujeres tendieron a mantenerse por encima de los casos reportados por hombres, siendo la separación más clara en el período de pandemia.  
+  
+```{r}
+sexo_ts <- tibl_to_ts(integrated_data4,
+                date_column = "TIEMPO",
+                grouping_variables = c("SEXO"))
+fig_list[[paste0("fig", fig_count)]] <- 
+  ggplot_ts(sexo_ts$data, 
+            x_var = "TIEMPO", 
+            y_var = "TOTAL",
+            color_var = "SEXO", 
+            x_lab = "Tiempo", 
+            y_lab = "Total de Casos Reportados",
+            color_lab = "Sexo")
+fig_list[[paste0("fig", fig_count)]] 
+fig_list[[paste0("fig", fig_count)]] %>% plotly::ggplotly()
+fig_count <- fig_count + 1
+```
+
+### Intoxicaciones totales según grupo etario
+  
+Los casos totales reportados entre enero 2015 y diciembre 2022, separados por grupo etario, se muestran en la Figura `r fig_count`. A continuación el detalle:  
+  
+* El grupo etario de 0 a 4 años mostró una tendencia a tener más reportes por intoxicaciones a lo largo del período analizado, sin embargo, aunque tuvo su valor más alto en marzo 2020, se muestra una tendencia a la disminución entre el 2020 y 2021.  
+* El grupo etario de 5 a 9 años, mostró un comportamiento estable a lo largo de todo el período, oscilando alrededor de los 50 casos totales por mes.  
+* El grupo etario de 10 a 14 años mostró una tendencia al aumento en las intoxicaciones reportadas a partir de julio 2021.
+* En general, de 15 años en adelante, los grupos etarios mostraron una tendencia al aumento en el reporte de intoxicaciones, y prácticamente todos tuvieron un valor máximo de reportes en junio 2021.  
+  
+```{r}
+getario_ts <- tibl_to_ts(integrated_data4,
+                date_column = "TIEMPO",
+                grouping_variables = c("GRUPO_ETARIO"))
+fig_list[[paste0("fig", fig_count)]] <- 
+  ggplot_ts(getario_ts$data, 
+            x_var = "TIEMPO", 
+            y_var = "TOTAL",
+            color_var = "GRUPO_ETARIO", 
+            x_lab = "Tiempo", 
+            y_lab = "Total de Casos Reportados",
+            color_lab = "Grupo Etario")
+fig_list[[paste0("fig", fig_count)]] 
+fig_list[[paste0("fig", fig_count)]] %>% plotly::ggplotly()
+fig_count <- fig_count + 1
+```
+
+### Intoxicaciones totales según causa
+  
+Los casos totales reportados entre enero 2015 y diciembre 2022, separados por causa según reportada en el sistema, se muestran en la Figura `r fig_count`. Sin embargo, resulta un poco difícil distinguir entre las diversas categorías por lo que se creó una nueva variable para brindar más visibilidad a las más importantes.  
+  
+```{r}
+causa_ts <- tibl_to_ts(integrated_data4,
+                date_column = "TIEMPO",
+                grouping_variables = c("CAUSA"))
+fig_list[[paste0("fig", fig_count)]] <- 
+  ggplot_ts(causa_ts$data, 
+            x_var = "TIEMPO", 
+            y_var = "TOTAL",
+            color_var = "CAUSA", 
+            x_lab = "Tiempo", 
+            y_lab = "Total de Casos Reportados",
+            color_lab = "Causa") 
+fig_list[[paste0("fig", fig_count)]] 
+fig_list[[paste0("fig", fig_count)]] %>% plotly::ggplotly()
+fig_count <- fig_count + 1
+```
+  
+Los casos totales reportados entre enero 2015 y diciembre 2022, separados por causa de interés, se muestran en la Figura `r fig_count`. El resultado más visible es el valor alto alcanzado en junio de 2021 para la reacción adversa a medicamentos. Dado esto, se pudo hipotetizar que los valores máximos observados en el gráfico de totales y los grupos etarios estuvo posiblemente muy relacionado con las vacunas contra el SARS-CoV-2. Otro elemento notorio fue la tendencia al aumento de las causas por adicción y tentativa de suicidio, esta última a partir del 2020. Finalmente, las causas accidentales son las que se mostraron como la causa principal de reportes durante la mayor parte del período analizado, pero mostraron una tendencia a la disminución a partir del 2021.  
+  
+```{r}
+causa_ts <- tibl_to_ts(integrated_data4,
+                date_column = "TIEMPO",
+                grouping_variables = c("CAUSA_INTERES"))
+fig_list[[paste0("fig", fig_count)]] <- 
+  ggplot_ts(causa_ts$data, 
+            x_var = "TIEMPO", 
+            y_var = "TOTAL",
+            color_var = "CAUSA_INTERES", 
+            x_lab = "Tiempo", 
+            y_lab = "Total de Casos Reportados",
+            color_lab = "Causa") 
+png(filename = file.path(img_folder, "1.2.Exploratorio.png"),
+    width = 720, height = 340, units = "px")
+fig_list[[paste0("fig", fig_count)]] 
+dev.off()
+fig_list[[paste0("fig", fig_count)]] %>% plotly::ggplotly()
+fig_count <- fig_count + 1
+```  
+  
+### Intoxicaciones totales según toxico de interés
+  
+#### Vacunas SARS-CoV-2  
+  
+La Figura `r fig_count` muestra los reportes de intoxicación debidos a las vacunas contra el SARS-CoV-2. Los reportes comprenden el período entre enero 2021 y diciembre 2022, siendo las más relevantes la de Astrazeneca y la de Pfizer. Se observó un valor máximo de 740 reportes por efectos adversos de la vacuna de Astrazeneca en junio 2021, mientras que para la vacuna de Pfizer el valor máximo se alcanzó en mayo 2021 para un total de 343 reportes.  
+  
+```{r}
+cod_tox_ts <- tibl_to_ts(integrated_data4,
+                date_column = "TIEMPO",
+                grouping_variables = c("TOXICO_INTERES1"))
+
+datos_vacunas <- cod_tox_ts$data %>% 
+  filter(str_detect(TOXICO_INTERES1, "VACUNA")) %>% 
+  mutate(
+    TOXICO_INTERES1 = stringr::str_remove(TOXICO_INTERES1, "VACUNA COVID ")
+  ) %>% 
+  filter(
+    TOXICO_INTERES1 != "JOHNSON & JOHNSON"
+  )
+
+(nrow(datos_vacunas)/nrow(integrated_data4))*100
+
+integrated_data4 %>% 
+  filter(str_detect(TOXICO_INTERES1, "VACUNA")) %>%
+  select(YEAR, SEXO, GRUPO_ETARIO) %>% 
+  tbl_summary(
+        by = YEAR,
+        # sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(SEXO ~ "Sexo",
+                     GRUPO_ETARIO = "Grupo Etario"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**")
+
+fig_list[[paste0("fig", fig_count)]] <- 
+  ggplot_ts(datos_vacunas, 
+            x_var = "TIEMPO", 
+            y_var = "TOTAL",
+            color_var = "TOXICO_INTERES1", 
+            x_lab = "Tiempo", 
+            y_lab = "Total de Casos Reportados",
+            color_lab = "Vacuna contra SARS-CoV-2")
+png(filename = file.path(img_folder, "1.3.Exploratorio.png"),
+    width = 720, height = 340, units = "px")
+fig_list[[paste0("fig", fig_count)]] 
+dev.off()
+fig_list[[paste0("fig", fig_count)]] %>% plotly::ggplotly()
+fig_count <- fig_count + 1
+```
+  
+#### Animales y Plantas  
+  
+La Figura `r fig_count` muestra los reportes de intoxicación debidos a plantas y algunas categorías de animales de interés. En general, resaltó la estacionalidad tan marcada que se observa en los reportes por picadura de alacranes, que se incrementan entre los meses de diciembre y abril, coincidiendo con la época seca del país.  
+  
+Algunos comportamientos interesantes observados se detallan a continuación:  
+  
+* Las intoxicaciones por plantas tuvieron su valor de reporte más alto en mayo 2020 con un total de 34 casos.  
+* El reporte de intoxicaciones por mordeduras de serpientes ha aumentado desde noviembre 2018, teniendo su valor máximo en octubre del 2022 con 36 casos reportados, seguido por octubre 2020 con 35 casos. 
+* El reporte de intoxicaciones causadas por picadura de avispas y abejas mostró un comportamiento muy similar.  
+  
+Estas diferentes categorías sugieren cierta estacionalidad, sin embargo, el análisis no se realizará como parte de este proceso debido a que la cantidad de casos reportada no es tan alta, y su asociación con la pandemia podría estar influenciada por múltiples factores.   
+  
+```{r}
+animales_plantas <- c("Abejas", "Alacranes", "Avispas", "Plantas", "Serpientes", "Animales")
+
+datos_animales <- cod_tox_ts$data %>% 
+  filter(TOXICO_INTERES1 %in% animales_plantas)
+
+fig_list[[paste0("fig", fig_count)]] <- 
+  ggplot_ts(datos_animales, 
+            x_var = "TIEMPO", 
+            y_var = "TOTAL",
+            color_var = "TOXICO_INTERES1", 
+            x_lab = "Tiempo", 
+            y_lab = "Total de Casos Reportados",
+            color_lab = "Tóxico de Interés", 
+            facet_var = "TOXICO_INTERES1",
+            facet_cols = 2)
+fig_list[[paste0("fig", fig_count)]] 
+ggplot_ts(datos_animales, 
+            x_var = "TIEMPO", 
+            y_var = "TOTAL",
+            color_var = "TOXICO_INTERES1", 
+            x_lab = "Tiempo", 
+            y_lab = "Total de Casos Reportados",
+            color_lab = "Tóxico de Interés")  %>% plotly::ggplotly()
+fig_count <- fig_count + 1
+```
+  
+#### Medicamentos  
+  
+La Figura `r fig_count` muestra los reportes de intoxicación debidos a medicamentos de interés. A continuación se detallan algunas observaciones de relevancia:  
+  
+* Para los analgésicos narcóticos, se observó un leve incremento en el número de reportes a partir de mayo de 2018 en comparación con el período anterior, sin embargo, a partir de mayo 2020 se mostró otro aumento considerable que mantuvo constante durante el 2021 y 2022.  
+* Los reportes por intoxicaciones con antibióticos mostraron un leve incremento a partir de mayo 2019, y se ha mantenido estable desde entonces.  
+* El reporte de intoxicaciones con anticonvulsivos ha mantenido una tendencia creciente desde finales del 2019.  
+* El reporte de intoxicaciones con antidepresivos y psicoestimulantes se incrementó sustancialmente a partir de mayo de 2020, lo que podría sugerir una asociación con la pandemia. Sin embargo, los valores máximos se alcanzaron durante el año 2022.   
+* Los reportes de intoxicaciones con antihistamínicos, antieméticos y antipruriticos han mostrado una tendencia al aumento desde el año 2020, teniendo el mayor número de reportes en marzo 2020.  
+* Los medicamentos de la categoría antipsicóticos mostraron un cambio de nivel en la cantidad de casos reportados a partir de la segunda mitad del 2020.  
+* Los reportes de intoxicaciones con biológicos, vacunas, toxoides y antitoxinas, distintos de las vacunas COVID, presentaron una estacionalidad muy marcada, con valores muy altos en los meses entre mayo y julio de cada año.  
+* Los reportes de intoxicaciones con medicamentos para el dolor, mostraron un aumento de nivel marcado a partir de abril de 2020.  
+* Los reportes de intoxicaciones con sedantes, hipnóticos y ansiolíticos presentaron una tendencia al aumento desde finales del 2019, sin embargo, la tendencia ha continuado aumentando y alcanzó valores máximos entre setiembre y noviembre de 2022.   
+  
+```{r}
+meds <- c("Analgesicos Narcoticos", "Antiasmaticos y broncodilatadores",
+          "Antibioticos", "Anticonvulsivos", "Antidepresivos y psicoestimulantes",
+          "Antihipertensivos", "Antihistaminicos, antiemeticos, antipruriticos",
+          "Antipsicoticos", "Antitusigenos, fluidificantes y expectorantes",
+          "Biologicos, vacunas, toxoides y antitoxinas",
+          "Medicamentos para el dolor",
+          "Sedantes/hipnoticos, ansioliticos")
+
+datos_medicamentos <- cod_tox_ts$data %>% 
+  filter(TOXICO_INTERES1 %in% meds)
+
+fig_list[[paste0("fig", fig_count)]] <- 
+  ggplot_ts(datos_medicamentos, 
+            x_var = "TIEMPO", 
+            y_var = "TOTAL",
+            color_var = "TOXICO_INTERES1", 
+            x_lab = "Tiempo", 
+            y_lab = "Total de Casos Reportados",
+            color_lab = "Tóxico de Interés",
+            facet_var = "TOXICO_INTERES1",
+            facet_cols = 3)
+fig_list[[paste0("fig", fig_count)]] 
+ggplot_ts(datos_medicamentos, 
+            x_var = "TIEMPO", 
+            y_var = "TOTAL",
+            color_var = "TOXICO_INTERES1", 
+            x_lab = "Tiempo", 
+            y_lab = "Total de Casos Reportados",
+            color_lab = "Tóxico de Interés") %>% plotly::ggplotly()
+fig_count <- fig_count + 1
+```
+  
+#### Medicamentos Asociados con Salud Mental  
+  
+```{r}
+med_ts <- tibl_to_ts(integrated_data4,
+                date_column = "TIEMPO",
+                grouping_variables = c("TOXICO_INTERES_HL1"))
+
+meds2 <- c("Analgesicos Narcoticos", "Antiasmaticos y broncodilatadores",
+          "Antibioticos", "Anticonvulsivos", 
+          "Antihipertensivos", "Antihistaminicos, antiemeticos, antipruriticos",
+          "Antitusigenos, fluidificantes y expectorantes",
+          "Biologicos, vacunas, toxoides y antitoxinas",
+          "Medicamentos para el dolor",
+          "Medicamentos asociados con salud mental")
+
+datos_medicamentos <- med_ts$data %>% 
+  filter(TOXICO_INTERES_HL1 %in% meds2)
+
+fig_list[[paste0("fig", fig_count)]] <- 
+  ggplot_ts(datos_medicamentos, 
+            x_var = "TIEMPO", 
+            y_var = "TOTAL",
+            color_var = "TOXICO_INTERES_HL1", 
+            x_lab = "Tiempo", 
+            y_lab = "Total de Casos Reportados",
+            color_lab = "Tóxico de Interés",
+            facet_var = "TOXICO_INTERES_HL1",
+            facet_cols = 2)
+fig_list[[paste0("fig", fig_count)]] 
+ggplot_ts(datos_medicamentos, 
+            x_var = "TIEMPO", 
+            y_var = "TOTAL",
+            color_var = "TOXICO_INTERES_HL1", 
+            x_lab = "Tiempo", 
+            y_lab = "Total de Casos Reportados",
+            color_lab = "Tóxico de Interés") %>% plotly::ggplotly()
+fig_count <- fig_count + 1
+```
+  
+  
+#### Otras Categorías de Tóxicos de Interés  
+  
+La Figura `r fig_count` muestra los reportes de intoxicación debidos a otras categorías de tóxicos de interés. A continuación se detallan algunas observaciones de relevancia:    
+  
+* Se observó una tendencia leve al aumento de reportes por intoxicación con alimentos y bebidas a partir de diciembre 2019.  
+* El reporte de intoxicaciones con drogas de abuso se duplicó a partir de mediados del 2019, sin embargo, estos reportes se triplicaron (respecto al período 2015 a 2018) a partir de diciembre 2020 y se han mantenido estables desde entonces.  
+* Los reportes de intoxicaciones por plaguicidas tienen una estacionalidad marcada, ocurriendo los mayores reportes por lo general en mayo de cada año. A diferencia de otros tóxicos, la tendencia es muy leve hacia una menor cantidad de reportes cada año.  
+¨* Los reportes por intoxicación con productos de limpieza tuvieron su mayor valor en marzo de 2020, que coincide con el inicio de la pandemia en Costa Rica. El número de reportes se mantuvo por lo general cerca o superior a los 100 casos por mes durante todo el año 2020, mientras que en el 2021 empezó su decenso hasta llegar en 2022 a valores similares al período anterior a la pandemia.  
+  
+```{r}
+otros_tox <- c("Alimentos y bebidas", "Drogas de Abuso", "Plaguicidas",
+               "Productos de Limpieza", "Quimicos/Comerciales/Industriales")
+
+datos_otros <- cod_tox_ts$data %>% 
+  filter(TOXICO_INTERES1 %in% otros_tox)
+
+fig_list[[paste0("fig", fig_count)]] <- 
+  ggplot_ts(datos_otros, 
+            x_var = "TIEMPO", 
+            y_var = "TOTAL",
+            color_var = "TOXICO_INTERES1", 
+            x_lab = "Tiempo", 
+            y_lab = "Total de Casos Reportados",
+            color_lab = "Tóxico de Interés",
+            facet_var = "TOXICO_INTERES1",
+            facet_cols = 2)
+fig_list[[paste0("fig", fig_count)]] 
+  ggplot_ts(datos_otros, 
+            x_var = "TIEMPO", 
+            y_var = "TOTAL",
+            color_var = "TOXICO_INTERES1", 
+            x_lab = "Tiempo", 
+            y_lab = "Total de Casos Reportados",
+            color_lab = "Tóxico de Interés") %>% plotly::ggplotly()
+fig_count <- fig_count + 1
+```
+
+### Intoxicaciones según sexo y toxico de interés sin considerar los datos de vacunas covid-19 ni animales y plantas
+  
+La Figura `r fig_count` muestra los reportes de intoxicación según el tóxico de interés por panel y separado según sexo. En general, los individuos masculinos presentaron un mayor número de reportes marcado para drogas de abuso, plaguicidas, y químicos comerciales e industriales. Mientras que los individuos femeninos tienden a tener un mayor número de reportes para las diferentes categorías de medicamentos.   
+  
+```{r}
+integrated_data_fm <- integrated_data4 %>% 
+  filter(SEXO %in% c("Femenino", "Masculino"),
+         GRUPO_ETARIO != "No Anotado")
+
+integrated_data_no_vac <- integrated_data_fm %>% 
+  filter(!grepl("COVID", TOXICO1),
+         !TOXICO_INTERES1 %in% c(animales_plantas))
+
+ novac_ts <- tibl_to_ts(integrated_data_no_vac,
+                      date_column = "TIEMPO",
+                      grouping_variables = c("SEXO", "TOXICO_INTERES1"))
+
+fig_list[[paste0("fig", fig_count)]] <- 
+ ggplot_ts(novac_ts$data, 
+          x_var = "TIEMPO", 
+          y_var = "TOTAL",
+          color_var = "SEXO", 
+          facet_var = "TOXICO_INTERES1",
+          x_lab = "Tiempo", 
+          y_lab = "Total de Casos Reportados",
+          color_lab = "Sexo",
+          free_y = TRUE,
+          facet_cols = 3)
+fig_list[[paste0("fig", fig_count)]] 
+fig_list[[paste0("fig", fig_count)]]  %>% plotly::ggplotly()
+fig_count <- fig_count + 1
+```
+  
+### Separacion de datos según causa  
+  
+```{r}
+integrated_data_no_vac$CAUSA %>% table %>% prop.table() %>% sort
+integrated_data_no_vac$CAUSA_INTERES %>% table %>% prop.table() %>% sort
+
+otras_causas_df <- integrated_data_no_vac %>% 
+  filter(CAUSA_INTERES == "Otras")
+table(otras_causas_df$TOXICO_INTERES1, otras_causas_df$CAUSA)
+table(otras_causas_df$CAUSA)
+
+integrated_data_novac2 <- integrated_data_no_vac %>% 
+  filter(CAUSA_INTERES != "Otras",
+         # TOXICO_INTERES1 != "Otros",
+         CANTON != "Desconocido") %>% 
+  select(
+    YEAR,
+    CANTON,
+    CODTOX1,
+    FECHA,
+    RUTA,
+    SEVERIDAD,
+    SEXO,
+    EDAD_A,
+    GRUPO_ETARIO,
+    CAUSA,
+    CLASIFARMA1,
+    PERIODO,
+    TIEMPO,
+    CAUSA_INTERES,
+    TOXICO_INTERES1,
+    TOXICO_INTERES_HL1,
+    SPEC_TOXICO_INTERES,
+    TOXICO1
+  )
+
+nrow(integrated_data_no_vac)
+nrow(integrated_data_novac2)
+
+save_folder <- "datos_procesados"
+
+intox_accidental <- integrated_data_novac2 %>% 
+  filter(
+    CAUSA_INTERES == "Accidental"
+  )
+(nrow(intox_accidental)/nrow(integrated_data4))*100
+
+write_rds(intox_accidental, file.path(save_folder, "intox_accidentales.RDS"))
+
+intox_rxad <- integrated_data_novac2 %>% 
+  filter(
+    CAUSA_INTERES == "Reacción adversa a medicamentos, Errores y Automedicación"
+  )
+(nrow(intox_rxad)/nrow(integrated_data4))*100
+
+intox_rxad %>% 
+  filter(YEAR == 2019) %>% 
+  filter(CAUSA == "06.Automedicacion") %>% 
+  nrow()
+
+intox_rxad %>% 
+  filter(YEAR == 2020) %>% 
+  filter(CAUSA == "06.Automedicacion") %>% 
+  nrow()
+
+intox_rxad %>% 
+  filter(YEAR == 2021) %>% 
+  filter(CAUSA == "06.Automedicacion") %>% 
+  nrow()
+
+intox_rxad %>% 
+  filter(YEAR == 2022) %>% 
+  filter(CAUSA == "06.Automedicacion") %>% 
+  nrow()
+
+
+intox_rxad %>% 
+  filter(YEAR == 2019) %>% 
+  filter(CAUSA == "08.Errores de medicacion") %>% 
+  nrow()
+
+intox_rxad %>% 
+  filter(YEAR == 2020) %>% 
+  filter(CAUSA == "08.Errores de medicacion") %>% 
+  nrow()
+
+intox_rxad %>% 
+  filter(YEAR == 2021) %>% 
+  filter(CAUSA == "08.Errores de medicacion") %>% 
+  nrow()
+
+intox_rxad %>% 
+  filter(YEAR == 2022) %>% 
+  filter(CAUSA == "08.Errores de medicacion") %>% 
+  nrow()
+
+intox_rxad %>% 
+  filter(YEAR == 2019) %>% 
+  filter(CAUSA == "13.Rxn.adversa medicamentos") %>% 
+  nrow()
+
+intox_rxad %>% 
+  filter(YEAR == 2020) %>% 
+  filter(CAUSA == "13.Rxn.adversa medicamentos") %>% 
+  nrow()
+
+intox_rxad %>% 
+  filter(YEAR == 2021) %>% 
+  filter(CAUSA == "13.Rxn.adversa medicamentos") %>% 
+  nrow()
+
+intox_rxad %>% 
+  filter(YEAR == 2022) %>% 
+  filter(CAUSA == "13.Rxn.adversa medicamentos") %>% 
+  nrow()
+
+write_rds(intox_rxad, file.path(save_folder, "intox_reacciones.RDS"))
+
+intox_sui <- integrated_data_novac2 %>% 
+  filter(
+    CAUSA_INTERES == "Tentativa de suicidio"
+  )
+(nrow(intox_accidental)/nrow(integrated_data4))*100
+
+write_rds(intox_sui, file.path(save_folder, "intox_suicidio.RDS"))
+
+intox_adiccion <- integrated_data_novac2 %>% 
+  filter(
+    CAUSA_INTERES == "Adicción"
+  )
+(nrow(intox_adiccion)/nrow(integrated_data4))*100
+
+write_rds(intox_adiccion, file.path(save_folder, "intox_adiccion.RDS"))
+
+intox_alimentaria <- integrated_data_novac2 %>% 
+  filter(
+    CAUSA_INTERES == "Alimentaria"
+  )
+(nrow(intox_alimentaria)/nrow(integrated_data4))*100
+
+write_rds(intox_alimentaria, file.path(save_folder, "intox_alimentarias.RDS"))
+
+intox_ocupacional <- integrated_data_novac2 %>% 
+  filter(
+    CAUSA_INTERES == "Ocupacional"
+  )
+(nrow(intox_ocupacional)/nrow(integrated_data4))*100
+
+write_rds(intox_ocupacional, file.path(save_folder, "intox_ocupacional.RDS"))
+```
+
+## Exportando otros datos de interés
+
+```{r}
+write_rds(pob_year_sexo_ge_canton, file.path(save_folder, "pob_data.RDS"))
+write_rds(meds, file.path(save_folder, "meds.RDS"))
+write_rds(cantones_st, file.path(save_folder, "cantones_st.RDS"))
+```
+

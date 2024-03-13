@@ -1,0 +1,2982 @@
+---
+title: "Análisis de Intoxicaciones Accidentales Reportadas"
+author: "Edgardo Gutiérrez Vega"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    downcute_theme: "chaos"
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(cache = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 99)
+read_folder <- "datos_procesados"
+save_graficos <- "resultados_graficos"
+causa_ref <- "Accidental"
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(gtsummary)
+library(sf)
+library(FactoMineR)
+library(factoextra)
+source("R/tibl_to_ts.R")
+source("R/ggplot_ts.R")
+source("R/plot_map.R")
+source("R/get_ts_from_agg_df.R")
+source("R/get_arima_model.R")
+source("R/get_change_points.R")
+source("R/generate_counts.R")
+source("R/generate_counts_v2.R")
+source("R/generate_dtw_cluster_plot.R")
+source("R/analisis_correspondencia.R")
+source("R/get_cumulative_frequencies.R")
+source("R/generate_prophet_forecast.R")
+source("R/gg_arma_spanish.R")
+source("R/gg_tsresiduals_spanish.R")
+source("R/gg_tsdisplay_spanish.R")
+library(fable)
+library(feasts)
+img_folder <- "0.documento_final/img_finales/1.Accidentales"
+tab_folder <- "0.documento_final/tab_finales/1.Accidentales"
+intox_accidental <- read_rds(file.path(read_folder, "intox_accidentales.RDS"))
+pob_year_sexo_ge_canton <- read_rds(file.path(read_folder, "pob_data.RDS"))
+meds <- read_rds(file.path(read_folder, "meds.RDS"))
+cantones_st <- read_rds(file.path(read_folder, "cantones_st.RDS"))
+table_count <- 1
+summary_arima_mods <- tibble()
+```
+
+## Procesamiento de datos accidentales  
+  
+En el caso de las intoxicaciones accidentales, el Cuadro  `r table_count` muestra que los grupos principales de interes con los que se reporta este tipo de intoxicaciones son los productos de limpieza, los plaguicidas, químicos/comerciales/industriales, y los medicamentos para el dolor, todos con un total superior a 1 mil casos en el período de 2015 a 2022, para un total aproximado de 77% de los casos reportados como causa accidental. 
+  
+```{r}
+intox_accidental$TOXICO_INTERES1 %>% table %>% prop.table() %>% sort
+
+intox_accidental_freq_table <- get_cumulative_frequencies(intox_accidental, "TOXICO_INTERES1")
+
+table_count <- table_count + 1
+
+(intox_accidental_export_table <- intox_accidental_freq_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  mutate(TOX_FREQ = paste0(TOX_FREQ, "%"),
+         TOX_FREQ_CUMSUM = paste0(TOX_FREQ_CUMSUM, "%")) %>% 
+  rename(
+    `Tipo de Tóxico Principal` = TOXICO_INTERES1,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+intox_accidental_export_table %>% 
+  gt::gtsave(file.path(tab_folder, "1.1.Accidentales.rtf"))
+intox_accidental_export_table %>% 
+  gt::gtsave(file.path(tab_folder, "1.1.Accidentales.tex"))
+```
+  
+Al visualizar más en detalle la categoría "Otros" en los tóxicos de interés, la variedad a nivel de tóxico sugiere que algunos de estos tóxicos pueden agruparse en la categoría de "Medicamentos".     
+  
+```{r}
+otros_acc_df <- intox_accidental %>% 
+  filter(TOXICO_INTERES1 == "Otros")
+
+intox_accidental_otros_table <- get_cumulative_frequencies(otros_acc_df, "TOXICO1")
+
+table_count <- table_count + 1
+
+intox_accidental_otros_table %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+```
+  
+Al visualizarlos a nivel de código de tóxico, efectivamente más de 2 mil casos equivalentes al 83% son medicamentos, por lo que se incluirá este nivel dentro de los tóxicos de interés.  
+  
+```{r}
+intox_accidental_otros_codtox <- get_cumulative_frequencies(otros_acc_df, "CODTOX1")
+
+table_count <- table_count + 1
+
+intox_accidental_otros_codtox %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+
+(intox_accidental_otros_export_table <- intox_accidental_otros_codtox %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  mutate(TOX_FREQ = paste0(TOX_FREQ, "%"),
+         TOX_FREQ_CUMSUM = paste0(TOX_FREQ_CUMSUM, "%"),
+         CODTOX1 = str_remove_all(CODTOX1, "[[:digit:]]+\\.")) %>% 
+  rename(
+    `Tipo de Tóxico Principal` = CODTOX1,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+intox_accidental_otros_export_table %>% 
+  gt::gtsave(file.path(tab_folder, "1.2.Accidentales_otros.rtf"))
+intox_accidental_otros_export_table %>% 
+  gt::gtsave(file.path(tab_folder, "1.2.Accidentales_otros.tex"))
+```  
+  
+Al realizar este cambio, los productos de limpieza se mantienen en como los principales cursos de interés, mientras que la nueva categoría "Otros Medicamentos" se ubica en segundo lugar.   
+  
+```{r}
+intox_accidental <- intox_accidental %>% 
+  mutate(
+    TOXICO_INTERES1_BACKUP = TOXICO_INTERES1,
+    TOXICO_INTERES1 = case_when(
+      CODTOX1 == "01.Medicamentos" & TOXICO_INTERES1 == "Otros" ~ "Otros Medicamentos",
+      TRUE ~ TOXICO_INTERES1
+    )
+  )
+
+intox_accidental_freq_table <- get_cumulative_frequencies(intox_accidental, "TOXICO_INTERES1")
+
+table_count <- table_count + 1
+
+(intox_accidental_final_export_table <- intox_accidental_freq_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  mutate(TOX_FREQ = paste0(TOX_FREQ, "%"),
+         TOX_FREQ_CUMSUM = paste0(TOX_FREQ_CUMSUM, "%")) %>% 
+  rename(
+    `Tipo de Tóxico Principal` = TOXICO_INTERES1,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+intox_accidental_final_export_table %>% 
+  gt::gtsave(file.path(tab_folder, "1.3.Accidentales.rtf"))
+intox_accidental_final_export_table %>% 
+  gt::gtsave(file.path(tab_folder, "1.3.Accidentales.tex"))
+```
+  
+El análisis de agrupamiento de las diferentes series de tiempo para los tóxicos de interés solo muestra un comportamiento claramente diferenciado para los productos de limpieza después del 2020. No se apreció ningún cambio especialmente notable para los medicamentos después de la pandemia, por lo que se procedió a combinarlos en un único grupo.  
+  
+```{r fig.width=10, fig.height=15}
+agg_intox_acc_toxs <- generate_counts2(
+  intox_accidental, 
+  date_column = "TIEMPO",
+  grouping_variables = c("TOXICO_INTERES1")) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_acc_toxs, k_clusters = 4)
+
+png(filename = file.path(img_folder, "1.1.Accidental.png"),
+    width = 920, height = 1000, units = "px")
+generate_dtw_cluster_plot(agg_intox_acc_toxs, k_clusters = 4, lab_y = "Total de Casos Reportados")  
+dev.off()
+```     
+  
+Al realizar este cambio, el grupo de los medicamentos pasa a liderar la tabla con un 34.7%, seguido por los productos de limpieza.    
+  
+```{r}
+intox_accidental <- intox_accidental %>% 
+  mutate(
+    TOXICO_INTERES1_BACKUP = TOXICO_INTERES1,
+    TOXICO_INTERES1 = case_when(
+      CODTOX1 == "01.Medicamentos" | TOXICO_INTERES1 %in% meds ~ "Medicamentos",
+      TRUE ~ TOXICO_INTERES1
+    )
+  )
+
+intox_accidental_freq_table <- get_cumulative_frequencies(intox_accidental, "TOXICO_INTERES1")
+
+table_count <- table_count + 1
+
+intox_accidental_freq_table %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt()
+
+(intox_accidental_final2_export_table <- intox_accidental_freq_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  mutate(TOX_FREQ = paste0(TOX_FREQ, "%"),
+         TOX_FREQ_CUMSUM = paste0(TOX_FREQ_CUMSUM, "%")) %>% 
+  rename(
+    `Tipo de Tóxico Principal` = TOXICO_INTERES1,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+intox_accidental_final2_export_table %>% 
+  gt::gtsave(file.path(tab_folder, "1.4.Accidentales.rtf"))
+intox_accidental_final2_export_table %>% 
+  gt::gtsave(file.path(tab_folder, "1.4.Accidentales.tex"))
+```
+  
+```{r fig.width=10, fig.height=15}
+agg_intox_acc_toxs <- generate_counts2(
+  intox_accidental, 
+  date_column = "TIEMPO",
+  grouping_variables = c("TOXICO_INTERES1")) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_acc_toxs, k_clusters = 4)
+```     
+  
+El Cuadro `r table_count` presenta el detalle de los tóxicos específicos relacionados con los reportes de intoxicación accidental, siendo el hipoclorito de sodio el principal tóxico reportado con 30% de los casos totales en todo el período analizado, seguido por la acetaminofen, desinfectantes y detergentes.  
+  
+```{r}
+table_count <- table_count + 1
+
+(intox_accidental_sel_toxicos <- get_cumulative_frequencies(intox_accidental, "TOXICO1") %>% 
+  mutate(
+    TOXICO1 = case_when(
+      TOX_FREQ < 2 ~ "Otros",
+      TRUE ~ TOXICO1
+    ),
+    TOXICO1 = str_to_title(TOXICO1)
+  ) %>% 
+  group_by(TOXICO1) %>% 
+  summarise(
+    TOX_N = sum(TOX_N),
+    TOX_FREQ = sum(TOX_FREQ)
+  ) %>%
+  arrange(desc(TOX_FREQ)) %>% 
+  arrange(TOXICO1 == "Otros") %>% 
+  mutate(TOX_FREQ_CUMSUM = cumsum(TOX_FREQ)) %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  rename(
+    `Tóxico Principal` = TOXICO1,
+    n = TOX_N,
+    `Frecuencia Relativa` = TOX_FREQ,
+    `Frecuencia Relativa Acumulada` = TOX_FREQ_CUMSUM
+  ) %>% 
+  gt::gt())
+
+intox_accidental_sel_toxicos %>% 
+  gt::gtsave(file.path(tab_folder, "1.5.Accidentales.rtf"))
+
+intox_accidental_sel_toxicos %>% 
+  gt::gtsave(file.path(tab_folder, "1.5.Accidentales.tex"))
+```  
+  
+El Cuadro `r table_count` presenta los conteos por año según sexo, grupo etario y tóxico de interés. Se observó que por lo general el grupo etario con edades entre los 0 y 4 años fue el que englobó más del 70% de los reportes por intoxicaciones accidentales a lo largo de todos los años, seguido por el grupo de 5 a 9 años. Tomando en cuenta estas frecuencias, se procedió a generar grupos etarios más generales para las otras edades.   
+  
+```{r}
+intox_accidental_fltd <- intox_accidental_freq_table %>% 
+  right_join(intox_accidental) %>%
+  filter(TOX_FREQ >= 9) 
+
+table_count <- table_count + 1
+
+intox_accidental_fltd %>%
+  select(YEAR, SEXO, GRUPO_ETARIO, TOXICO_INTERES1) %>% 
+       tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(TOXICO_INTERES1 ~ "Toxico de Interés"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**")
+```
+  
+El Cuadro `r table_count` presenta las proporciones actualizadas por año según los nuevos grupos etarios.  
+  
+```{r}
+intox_accidental_fltd <- intox_accidental_fltd %>% 
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      GRUPO_ETARIO %in% c("05 a 9 años", "10 a 14 años") ~ "5 a 14 años",
+      !GRUPO_ETARIO %in% c("0 a 4 años", "05 a 9 años", "10 a 14 años") ~ "Mayor a 15 años",
+      TRUE ~ GRUPO_ETARIO
+    )
+  )
+
+table_count <- table_count + 1
+
+intox_accidental_fltd %>%
+  select(YEAR, SEXO, GRUPO_ETARIO2, TOXICO_INTERES1, TOXICO1) %>% 
+       tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(TOXICO_INTERES1 ~ "Toxico de Interés"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**")
+
+(intox_accidental_sum_table <- intox_accidental_fltd %>%
+  select(YEAR, SEXO, GRUPO_ETARIO2) %>% 
+  tbl_summary(
+        by = YEAR,
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(SEXO ~ "Sexo", 
+                     GRUPO_ETARIO2  ~ "Grupo Etario"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**"))
+
+intox_accidental_sum_table %>% 
+  gtsummary::as_gt() %>% 
+  gt::gtsave(file.path(tab_folder, "1.6.Accidentales.rtf"))
+intox_accidental_sum_table %>% 
+  gtsummary::as_gt() %>% 
+  gt::gtsave(file.path(tab_folder, "1.6.Accidentales.tex"))
+```
+  
+## Heatmaps - Accidentales  
+  
+```{r}
+library("pheatmap")
+library(gridExtra)
+years_interes <- c(2019, 2020, 2021, 2022)
+agg_intox_accidental <- generate_counts2(
+  intox_accidental_fltd, 
+  date_column = "TIEMPO",
+  grouping_variables = c("CANTON", "SEXO", "GRUPO_ETARIO2", "TOXICO_INTERES1")) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+acc_ca_res <- analisis_correspondencia(agg_intox_accidental, years_interes)
+acc_heatmap_19 <- pheatmap(acc_ca_res$ca_results_list$Y2019$cont_mat, cutree_rows = 4,
+         scale = "none", display_numbers = T, main = "Año 2019")
+acc_heatmap_20 <- pheatmap(acc_ca_res$ca_results_list$Y2020$cont_mat, cutree_rows = 4,
+         scale = "none", display_numbers = T, main = "Año 2020")
+acc_heatmap_21 <- pheatmap(acc_ca_res$ca_results_list$Y2021$cont_mat, cutree_rows = 4,
+         scale = "none", display_numbers = T, main = "Año 2021")
+acc_heatmap_22 <- pheatmap(acc_ca_res$ca_results_list$Y2022$cont_mat, cutree_rows = 4,
+         scale = "none", display_numbers = T, main = "Año 2022")
+acc_plot_list=list()
+acc_plot_list[[1]] = acc_heatmap_19[[4]]
+acc_plot_list[[2]] = acc_heatmap_20[[4]]
+acc_plot_list[[3]] = acc_heatmap_21[[4]]
+acc_plot_list[[4]] = acc_heatmap_22[[4]]
+acc_heatmaps <- do.call("grid.arrange", c(acc_plot_list, ncol=2))
+# ggsave(file.path(save_graficos, "acc_heatmaps.png"), acc_heatmaps)
+```  
+  
+## Dynamic Time Warping Clustering - Accidentales  
+  
+https://damien-datasci-blog.netlify.app/post/time-series-clustering-with-dynamic-time-warp/  
+  
+```{r fig.width=10, fig.height=15}
+intox_accidental_fltd2 <- intox_accidental_fltd %>% 
+  filter(
+    GRUPO_ETARIO == "0 a 4 años"
+  )
+
+agg_intox_accidental <- generate_counts2(
+  intox_accidental_fltd2, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_accidental_std <- generate_counts2(
+  intox_accidental_fltd2, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "TOXICO_INTERES1", "GRUPO_ETARIO2"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_accidental_std, k_clusters = 4, lab_y = "Totales Estandarizados")
+generate_dtw_cluster_plot(agg_intox_accidental, k_clusters = 4, lab_y = "Total de Casos Reportados")
+
+png(filename = file.path(img_folder, "1.2.Accidental estadarizado.png"),
+    width = 920, height = 650, units = "px")
+generate_dtw_cluster_plot(agg_intox_accidental_std, k_clusters = 4, lab_y = "Totales Estandarizados")
+dev.off()
+
+png(filename = file.path(img_folder, "1.3.Accidental.png"),
+    width = 920, height = 650, units = "px")
+generate_dtw_cluster_plot(agg_intox_accidental, k_clusters = 4, lab_y = "Total de Casos Reportados")
+dev.off()
+```      
+  
+Debido a los resultados de los diferentes agrupamientos, se determinó apropiado combinar los casos de Hogar y Recreación con los cosméticos para crear un único grupo de Hogar y Recreación.
+  
+```{r fig.width=10, fig.height=15}
+intox_accidental_fltd3 <- intox_accidental_fltd2 %>% 
+    mutate(
+    TOXICO_INTERES1 = case_when(
+      # TOXICO_INTERES1 %in% c("Plaguicidas", "Quimicos/Comerciales/Industriales") ~ "Plaguicidas y otros quimicos",
+      TOXICO_INTERES1 %in% c("Hogar y Recreacion", "Cosmeticos") ~ "Hogar y Recreacion",
+      TRUE ~ TOXICO_INTERES1
+    )
+  )
+
+agg_intox_accidental3 <- generate_counts2(
+  intox_accidental_fltd3, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "GRUPO_ETARIO2", "TOXICO_INTERES1"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+agg_intox_accidental3_std <- generate_counts2(
+  intox_accidental_fltd3, 
+  date_column = "TIEMPO",
+  grouping_variables = c("SEXO", "GRUPO_ETARIO2", "TOXICO_INTERES1"),
+  standardize_counts = T) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+
+generate_dtw_cluster_plot(agg_intox_accidental3_std, k_clusters = 4)
+generate_dtw_cluster_plot(agg_intox_accidental3, k_clusters = 4)
+
+png(filename = file.path(img_folder, "1.4.Accidental estadarizado.png"),
+    width = 920, height = 650, units = "px")
+generate_dtw_cluster_plot(agg_intox_accidental3_std, k_clusters = 4, lab_y = "Totales Estandarizados")
+dev.off()
+
+png(filename = file.path(img_folder, "1.5.Accidental.png"),
+    width = 920, height = 650, units = "px")
+generate_dtw_cluster_plot(agg_intox_accidental3, k_clusters = 4, lab_y = "Total de Casos Reportados")
+dev.off()
+
+intox_accidental_fltd4 <- intox_accidental_fltd3 %>% 
+  filter(!TOXICO_INTERES1 %in% c("Quimicos/Comerciales/Industriales", "Plaguicidas"))
+
+agg_intox_accidental4 <- generate_counts2(
+  intox_accidental_fltd4, 
+  date_column = "TIEMPO",
+  grouping_variables = c("CANTON", "SEXO", "GRUPO_ETARIO2", "TOXICO_INTERES1"),
+  standardize_counts = F) %>% 
+  mutate(
+    YEAR = lubridate::year(TIEMPO)
+  )
+```
+  
+```{r}
+acc_prod_limpieza <- intox_accidental_fltd4 %>% 
+  filter(TOXICO_INTERES1 == "Productos de Limpieza") %>% 
+  filter(EDAD_A <= 4)
+
+(acc_prod_limpieza %>%
+  select(YEAR, TOXICO1) %>% 
+  tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(TOXICO1 = "Tóxico Principal"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**"))
+
+acc_prod_limpieza %>% 
+  filter(TOXICO1 == "HIPOCLORITO DE SODIO") %>% 
+  pull(RUTA) %>% 
+  table() %>%
+  sort 
+```
+
+```{r}
+acc_meds2 <- intox_accidental_fltd4 %>% 
+  filter(TOXICO_INTERES1 == "Medicamentos") %>% 
+  filter(EDAD_A <= 4)
+
+(acc_meds2 %>%
+  select(YEAR, TOXICO1) %>% 
+  tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(TOXICO1 = "Tóxico Principal"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**"))
+
+acc_meds2 %>% 
+  filter(TOXICO1 == "ACETAMINOFEN") %>% 
+  pull(RUTA) %>% 
+  table() %>%
+  sort 
+```
+  
+```{r}
+acc_hogar2 <- intox_accidental_fltd4 %>% 
+  filter(TOXICO_INTERES1 == "Hogar y Recreacion") %>% 
+  filter(EDAD_A <= 4)
+
+(acc_hogar2 %>%
+  select(YEAR, TOXICO1) %>% 
+  tbl_summary(
+        by = YEAR,
+        sort = all_categorical() ~ "frequency",
+        statistic = list(
+          all_continuous() ~ "{mean} ({sd})"
+          #all_categorical() ~ "{n} / {N} ({p}%)"
+        ),
+        digits = all_continuous() ~ 2,
+        label = list(TOXICO1 = "Tóxico Principal"),
+        missing_text = "(Missing)"
+      ) %>%
+      modify_header(all_stat_cols() ~ "**{level}**"))
+
+acc_hogar2 %>% 
+  filter(TOXICO1 == "COLONIA INFANTIL") %>% 
+  pull(RUTA) %>% 
+  table() %>%
+  sort 
+
+acc_hogar2 %>% 
+  filter(TOXICO1 == "COLONIA INFANTIL") %>% 
+  pull(RUTA) %>% 
+  table() %>%
+  sort %>% 
+  prop.table()
+```  
+  
+## Análisis de Correspondencia - Accidentales  
+  
+```{r}
+acc_ca_res <- analisis_correspondencia(agg_intox_accidental4, years_interes, include_sexo = FALSE)
+acc_ca_res$ca_plot
+```  
+  
+## Distribución Espacial  
+  
+La visualización espacial de los datos de intoxicaciones accidentales para los diferentes grupos, muestra ...   
+  
+```{r}
+pob_accidental <- pob_year_sexo_ge_canton %>% 
+  mutate(
+    GRUPO_ETARIO2 = case_when(
+      !Grupo %in% c("0 a 4 años") ~ "Mayor a 5 años",
+      TRUE ~ Grupo
+    )
+  ) %>% 
+  group_by(Year, `Provincia, cantón, distrito y sexo`, GRUPO_ETARIO2) %>% 
+  summarise(
+    Poblacion = sum(Poblacion)
+  ) %>% ungroup()
+
+agg_intox_accidental_mapa <- agg_intox_accidental4 %>% 
+  select(YEAR, CANTON, GRUPO_ETARIO2, TOXICO_INTERES1, TOTAL) %>% 
+  left_join(pob_accidental,
+             by = c(
+               "YEAR" = "Year",
+               "CANTON" = "Provincia, cantón, distrito y sexo",
+               "GRUPO_ETARIO2" = "GRUPO_ETARIO2"
+             )) %>% 
+  mutate(
+    TASA = (TOTAL / Poblacion) * 1000
+  )
+
+# map_acc_plag <- plot_map(agg_intox_accidental_mapa,
+#          cantones_st,
+#          years = years_interes,
+#          pob_ref = 1000,
+#          grupo_etario = "0 a 4 años",
+#          #sexo = "Masculino", 
+#          toxico = "Plaguicidas y otros quimicos"
+#          )
+# map_acc_plag$geo_plot + ggtitle("Casos de 0 a 4 años con Plaguicidas y otros químicos")
+# (map_acc_plag$geo_plot + ggtitle("Casos de 0 a 4 años con Plaguicidas y otros químicos")) %>% plotly::ggplotly(tooltip = "text")
+
+map_acc_limpieza <- plot_map(agg_intox_accidental_mapa,
+         cantones_st,
+         years = years_interes,
+         pob_ref = 1000,
+         grupo_etario = "0 a 4 años",
+         #sexo = "Masculino", 
+         toxico = "Productos de Limpieza"
+         )
+map_acc_limpieza$geo_plot + ggtitle("Casos de 0 a 4 años con Productos de Limpieza")
+(map_acc_limpieza$geo_plot + ggtitle("Casos de 0 a 4 años con Productos de Limpieza")) %>% plotly::ggplotly(tooltip = "text")
+
+map_acc_medicamentos <- plot_map(agg_intox_accidental_mapa,
+         cantones_st,
+         years = years_interes,
+         pob_ref = 1000,
+         grupo_etario = "0 a 4 años",
+         #sexo = "Masculino", 
+         toxico = "Medicamentos"
+         )
+map_acc_medicamentos$geo_plot + ggtitle("Casos de 0 a 4 años con Medicamentos")
+(map_acc_medicamentos$geo_plot + ggtitle("Casos de 0 a 4 años con Medicamentos")) %>% plotly::ggplotly(tooltip = "text")
+
+map_acc_hogar <- plot_map(agg_intox_accidental_mapa,
+         cantones_st,
+         years = years_interes,
+         pob_ref = 1000,
+         grupo_etario = "0 a 4 años",
+         #sexo = "Masculino", 
+         toxico = "Hogar y Recreación"
+         )
+map_acc_plag$geo_plot + ggtitle("Casos de 0 a 4 años con Hogar y Recreación")
+(map_acc_plag$geo_plot + ggtitle("Casos de 0 a 4 años con Hogar y Recreación")) %>% plotly::ggplotly(tooltip = "text")
+
+```
+  
+## Productos de Limpieza - 0 a 4 años  
+  
+```{r}
+acc_limpieza_0_4 <- get_ts_from_agg_df(agg_intox_accidental4, 
+                                   filtro_etario = "0 a 4 años",
+                                   filtro_toxico = "Productos de Limpieza")
+(acc_limpieza_prop <- sum(acc_limpieza_0_4$ts_full)/nrow(intox_accidental))
+
+acc_limpieza_0_4_tsibble <- acc_limpieza_0_4$agg_data %>% 
+  as_tsibble(index = TIEMPO) %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO))
+
+acc_limpieza_0_4_train <- acc_limpieza_0_4_tsibble %>% 
+  filter(TIEMPO < tsibble::yearmonth("2020-03"))
+acc_limpieza_0_4_test <- acc_limpieza_0_4_tsibble %>% 
+  filter(TIEMPO >= tsibble::yearmonth("2020-03"))
+```
+  
+### Changepoint - Enfoque cambio de nivel
+
+```{r}
+acc_limpieza_cpts <- get_change_points(acc_limpieza_0_4$ts_full)
+acc_limpieza_cpts$cp_plot
+```
+  
+### Outliers - Enfoque de valores extremos  
+  
+```{r}
+acc_limpieza_outliers <- forecast::tsoutliers(acc_limpieza_0_4$ts_full, lambda = NULL, iterate = 100)
+zoo::as.Date(acc_limpieza_0_4$ts_full)[acc_limpieza_outliers$index]
+```
+  
+### ARIMA - Enfoque Intervencion  
+  
+#### Estacionariedad y Autocorrelogramas Intervención   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+# DescTools::PlotACF(acc_limpieza_0_4$ts_full, main = "")
+
+acc_limpieza_0_4_tsibble %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+acc_limpieza_0_4_tsibble |>
+  features(TOTAL, unitroot_nsdiffs)
+
+acc_limpieza_0_4_tsibble |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+acc_limpieza_0_4_tsibble |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+acc_limpieza_0_4_tsibble |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportado entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+acc_limpieza_0_4_tsibble |>
+  gg_tsdisplay_spanish(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+acc_limpieza_0_4_tsibble |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  labs(title = "Diferenciado", y="")
+
+png(filename = file.path(img_folder, "1.6.Limpieza.png"),
+    width = 720, height = 480, units = "px")
+acc_limpieza_0_4_tsibble |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  ylab("Total de Casos Diferenciado (1)")
+dev.off()
+```  
+  
+#### Modelaje Intervención  
+  
+##### Selección del Modelo  
+  
+```{r}
+inter <- c(rep(0, 62), rep(1, 34))
+timeperiod <- 96
+
+# acc_limpieza_0_4_inter_model <- acc_limpieza_0_4_tsibble %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE))
+
+acc_limpieza_0_4_inter_model <- acc_limpieza_0_4_tsibble %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_100_auto = ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE),
+    
+    arima_010 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,0) + inter),
+    arima_110 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,0) +inter),
+    arima_011 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,0) +inter),
+    arima_111 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,0) +inter),
+    arima_210 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,0) +inter),
+    arima_012 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(0,0,0) +inter),
+    arima_211 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,0) +inter),
+    arima_112 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(0,0,0) +inter),
+    arima_212 = ARIMA(TOTAL ~ pdq(2,1,2) + PDQ(0,0,0) +inter),
+    
+    arima_010_100_3 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 3) + inter),
+    arima_110_100_3 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 3) + inter),
+    arima_011_100_3 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 3) + inter),
+    arima_111_100_3 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 3) + inter),
+    arima_210_100_3 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,0, period = 3) + inter),
+    arima_012_100_3 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(1,0,0, period = 3) + inter),
+    arima_211_100_3 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,0, period = 3) + inter),
+    arima_112_100_3 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(1,0,0, period = 3) + inter),
+    arima_212_100_3 = ARIMA(TOTAL ~ pdq(2,1,2) + PDQ(1,0,0, period = 3) + inter),
+    
+    arima_010_100_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 6) + inter),
+    arima_110_100_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 6) + inter),
+    arima_011_100_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 6) + inter),
+    arima_111_100_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 6) + inter),
+    arima_210_100_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,0, period = 6) + inter),
+    arima_012_100_6 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(1,0,0, period = 6) + inter),
+    arima_211_100_6 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,0, period = 6) + inter),
+    arima_112_100_6 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(1,0,0, period = 6) + inter),
+    arima_212_100_6 = ARIMA(TOTAL ~ pdq(2,1,2) + PDQ(1,0,0, period = 6) + inter),
+    
+    arima_010_100_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_110_100_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_011_100_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_111_100_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_210_100_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_012_100_12 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(1,0,0, period = 12) + inter),
+    arima_211_100_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_112_100_12 = ARIMA(TOTAL ~ pdq(1,1,2) + PDQ(1,0,0, period = 12) + inter),
+    arima_212_100_12 = ARIMA(TOTAL ~ pdq(2,1,2) + PDQ(1,0,0, period = 12) + inter)
+  )
+
+acc_limpieza_0_4_inter_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(acc_limpieza_0_4_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(intox_limpieza_arima_int_table <- glance(acc_limpieza_0_4_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ))
+
+intox_limpieza_arima_int_gt <- intox_limpieza_arima_int_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+intox_limpieza_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.7.Limpieza_arima_int.rtf"))
+intox_limpieza_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.7.Limpieza_arima_int.tex"))
+
+# arima_111_100_6 el componente estacional no es significativo
+# arima_012_100_6 el componente estacional no es significativo
+
+acc_limpieza_0_4_inter_sel_model <- acc_limpieza_0_4_inter_model |>
+  select(arima_012)
+
+acc_limpieza_0_4_inter_sel_model |>
+  report()
+
+limpieza_arima_inter_gt <- acc_limpieza_0_4_inter_sel_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "inter" ~ "Intervención",
+      term == "intercept" ~ "Intercepto",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+limpieza_arima_inter_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.8.Limpieza_arima_int_mod.rtf"))
+limpieza_arima_inter_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.8.Limpieza_arima_int_mod.tex"))
+
+
+acc_limpieza_0_4_inter_sel_model |> 
+  gg_tsresiduals(lag=timeperiod)
+
+png(filename = file.path(img_folder, "1.8.Limpieza_int_resids.png"),
+    width = 720, height = 480, units = "px")
+acc_limpieza_0_4_inter_sel_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+```
+  
+##### Verificación de Supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(acc_limpieza_0_4_inter_lb <- augment(acc_limpieza_0_4_inter_model) |>
+  filter(.model == "arima_012") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 2))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+  
+###### Raíces Unitarias  
+  
+```{r}
+acc_limpieza_0_4_inter_sel_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "1.7.Limpieza_int_roots.png"),
+    width = 720, height = 480, units = "px")
+acc_limpieza_0_4_inter_sel_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+  
+###### Normalidad de los residuos  
+  
+```{r}
+# Normalidad de Residuos - ARIMA
+acc_limpieza_0_4_inter_ts_residuals <- residuals(acc_limpieza_0_4_inter_sel_model, 
+                                    type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(acc_limpieza_0_4_inter_ts_residuals)
+
+(acc_limpieza_0_4_inter_jb_arima <- tseries::jarque.bera.test(acc_limpieza_0_4_inter_ts_residuals))
+
+(acc_limpieza_0_4_inter_shap_arima <-shapiro.test(acc_limpieza_0_4_inter_ts_residuals))
+
+car::qqPlot(acc_limpieza_0_4_inter_ts_residuals)
+
+# Normalidad de residuos - Regresion
+acc_limpieza_0_4_inter_reg_residuals <- residuals(acc_limpieza_0_4_inter_sel_model, type = "regression") %>% as_tibble() %>% pull(.resid)
+
+mean(acc_limpieza_0_4_inter_reg_residuals)
+
+(acc_limpieza_0_4_inter_shap_reg <- shapiro.test(acc_limpieza_0_4_inter_reg_residuals))
+
+car::qqPlot(acc_limpieza_0_4_inter_reg_residuals)
+
+# Visualizacion ambos graficos
+bind_rows(
+    `Regression residuals` =
+        as_tibble(residuals(acc_limpieza_0_4_inter_sel_model, type = "regression")),
+    `ARIMA residuals` =
+        as_tibble(residuals(acc_limpieza_0_4_inter_sel_model, type = "innovation")),
+    .id = "type"
+  ) |>
+  mutate(
+    TIEMPO = as_date(TIEMPO)
+  ) |>
+  ggplot(aes(x = TIEMPO, y = .resid)) +
+  geom_line() +
+  facet_grid(vars(type))
+```
+  
+##### Agrupación de resultados  
+  
+```{r}
+(summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Accidental por Productos de Limpieza",
+    Población = "Menores de 4 años",
+    Enfoque = "Intervención",
+    Modelo = "Regresion con ARIMA (0,1,2)",
+    # Significancia_intervencion = "No",
+    # ACF_Residuales = "Todos dentro",
+    # Histograma = "Aproximadamente Normal",
+    Residuals_LJung_Box_Test_ARIMA = round(acc_limpieza_0_4_inter_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(acc_limpieza_0_4_inter_jb_arima$p.value, 2),
+    # Residuals_Shapiro_Test_ARIMA = round(acc_limpieza_0_4_inter_shap_arima$p.value, 2),
+    Residuals_Shapiro_Wilk_Regression = round(acc_limpieza_0_4_inter_shap_reg$p.value, 2)
+  )))
+```
+  
+#### ARIMA - Enfoque Pronostico  
+  
+#### Estacionariedad y Autocorrelogramas Pronóstico   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+acc_limpieza_0_4_train %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+acc_limpieza_0_4_train |>
+  features(TOTAL, unitroot_nsdiffs)
+
+acc_limpieza_0_4_train |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+acc_limpieza_0_4_train |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+acc_limpieza_0_4_train |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+acc_limpieza_0_4_train |>
+  gg_tsdisplay_spanish(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+png(filename = file.path(img_folder, "1.9.Limpieza_pron.png"),
+    width = 720, height = 480, units = "px")
+acc_limpieza_0_4_train |>
+  gg_tsdisplay_spanish(TOTAL,
+               plot_type='partial', lag=36) +
+  ylab("Casos Totales")
+dev.off()
+
+acc_limpieza_0_4_train |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  labs(title = "Diferenciado", y="")
+```    
+  
+#### Modelaje Pronóstico     
+  
+##### Selección del Modelo  
+  
+```{r}
+# acc_limpieza_0_4_pron_model <- acc_limpieza_0_4_train %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE))
+# 
+# acc_limpieza_0_4_pron_model |>
+#   pivot_longer(everything(),
+#                names_to = "Model name",
+#                values_to = "Orders")
+
+acc_limpieza_0_4_pron_model <- acc_limpieza_0_4_train %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_111_auto = ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE),
+    arima_000 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,0,0)),
+    arima_100 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,0,0)),
+    arima_001 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,0,0)),
+    arima_101 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,0,0)),
+    arima_200 = ARIMA(TOTAL ~ pdq(2,0,0) + PDQ(0,0,0)),
+    arima_002 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(0,0,0)),
+    arima_202 = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(0,0,0)),
+    
+    arima_000_001_12 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,0,1, period = 12)),
+    arima_100_001_12 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,0,1, period = 12)),
+    arima_001_001_12 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,0,1, period = 12)),
+    arima_101_001_12 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,0,1, period = 12)),
+    arima_200_001_12 = ARIMA(TOTAL ~ pdq(2,0,0) + PDQ(0,0,1, period = 12)),
+    arima_002_001_12 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(0,0,1, period = 12)),
+    arima_202_001_12 = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(0,0,1, period = 12))
+  )
+
+acc_limpieza_0_4_pron_model_dif <- acc_limpieza_0_4_train %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_111_auto = ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE),
+    arima_010 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,0)),
+    arima_110 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,0)),
+    arima_011 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,0)),
+    arima_111 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,0)),
+    arima_210 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,0)),
+    arima_012 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(0,0,0)),
+    arima_212 = ARIMA(TOTAL ~ pdq(2,1,2) + PDQ(0,0,0)),
+    
+    arima_010_001_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,1, period = 12)),
+    arima_110_001_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,1, period = 12)),
+    arima_011_001_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,1, period = 12)),
+    arima_111_001_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,1, period = 12)),
+    arima_210_001_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,1, period = 12)),
+    arima_012_001_12 = ARIMA(TOTAL ~ pdq(0,1,2) + PDQ(0,0,1, period = 12)),
+    arima_212_001_12 = ARIMA(TOTAL ~ pdq(2,1,2) + PDQ(0,0,1, period = 12))
+  )
+
+# acc_limpieza_0_4_pron_model |> 
+#   pivot_longer(everything(), 
+#                names_to = "Model name",
+#                values_to = "Orders")
+
+glance(acc_limpieza_0_4_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+glance(acc_limpieza_0_4_pron_model_dif) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(intox_limpieza_pron_arima_table <- glance(acc_limpieza_0_4_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ) %>% 
+  slice(-1))
+
+intox_limpieza_arima_pron_gt <- intox_limpieza_pron_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+intox_limpieza_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.9.Limpieza_arima_pron.rtf"))
+intox_limpieza_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.9.Limpieza_arima_pron.tex"))
+
+acc_limpieza_0_4_final_arima_model <- acc_limpieza_0_4_pron_model |>
+  select(arima_100) 
+
+acc_limpieza_0_4_final_arima_model |>
+  report()
+
+limpieza_pron_arima_gt <- acc_limpieza_0_4_final_arima_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "constant" ~ "Constante",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+limpieza_pron_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.10.Limpieza_arima_pron_mod.rtf"))
+limpieza_pron_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.10.Limpieza_arima_pron_mod.tex"))
+
+png(filename = file.path(img_folder, "1.11.Limpieza_pron_resids.png"),
+    width = 720, height = 480, units = "px")
+acc_limpieza_0_4_final_arima_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+
+acc_limpieza_0_4_final_arima_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+```
+  
+##### Verificación de supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(acc_limpieza_0_4_lb <-  augment(acc_limpieza_0_4_pron_model) |>
+  filter(.model == "arima_100") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 1))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+   
+###### Raíces Unitarias
+   
+```{r}
+acc_limpieza_0_4_final_arima_model |> 
+  gg_arma_spanish()
+
+png(filename = file.path(img_folder, "1.10.Limpieza_pron_roots.png"),
+    width = 720, height = 480, units = "px")
+acc_limpieza_0_4_final_arima_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+   
+###### Normalidad de los residuos   
+   
+```{r}
+# Normalidad de Residuos - ARIMA
+acc_limpieza_0_4_residuals <- residuals(acc_limpieza_0_4_final_arima_model, type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(acc_limpieza_0_4_residuals)
+
+(acc_limpieza_0_4_jb_arima <- tseries::jarque.bera.test(acc_limpieza_0_4_residuals))
+
+(acc_limpieza_0_4_shap_arima <- shapiro.test(acc_limpieza_0_4_residuals))
+
+car::qqPlot(acc_limpieza_0_4_residuals)
+```
+   
+##### Agrupación de Resultados   
+   
+```{r}
+acc_limpieza_0_4_pron <- gen_pronostic_plot2(acc_limpieza_0_4_train, 
+                                      acc_limpieza_0_4_test,
+                                      acc_limpieza_0_4_final_arima_model,
+                                      h_forecast = 34)
+
+
+acc_limpieza_0_4_pron$pron_df <- acc_limpieza_0_4_pron$pron_df %>% 
+  mutate(
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(acc_limpieza_0_4_pron$pron_df$out)
+acc_limpieza_0_4_pron$pron_df$ds[acc_limpieza_0_4_pron$pron_df$out == 1]
+
+acc_limpieza_0_4_arima_sel_df <- forecast::accuracy(acc_limpieza_0_4_pron$pron_df$yhat,                                                    acc_limpieza_0_4_pron$pron_df$y) %>%
+  as_tibble() %>% 
+  mutate(Modelo = "ARIMA (1,0,0)",
+         Metric_Type = "Test set")
+
+summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Accidental por Productos de Limpieza",
+    Población = "Menores de 4 años",
+    Enfoque = "Pronóstico",
+    Modelo = "ARIMA (1,0,0)",
+    # ACF_Residuales = "Todos dentro",
+    # Histograma = "Aproximadamente Normal",
+    Residuals_LJung_Box_Test_ARIMA = round(acc_limpieza_0_4_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(acc_limpieza_0_4_jb_arima$p.value, 2)
+    # Residuals_Shapiro_Test_ARIMA = round(acc_limpieza_0_4_shap_arima$p.value, 2)
+  ))
+```
+  
+#### Prophet - Enfoque Pronóstico  
+   
+```{r}
+# acc_limpieza_prophet_mod <- generate_prophet_forecast(acc_limpieza_0_4$ts_train,
+#                                               acc_limpieza_0_4$ts_test,
+#                                               periods = 34)
+# write_rds(acc_limpieza_prophet_mod, "modelos/acc_limpieza_0_4_prophet.RDS")
+acc_limpieza_prophet <- readRDS("modelos/acc_limpieza_0_4_prophet.RDS")
+
+acc_limpieza_prophet$acc_consolidated %>%
+  mutate(model = 1:nrow(acc_limpieza_prophet$acc_consolidated)) %>% 
+  arrange(RMSE, MAPE)
+
+acc_limpieza_sel_prophet <- 52
+
+limpieza_forecast_tb <- acc_limpieza_prophet$forecast_tb_list[[acc_limpieza_sel_prophet]] %>% 
+  mutate(
+    y = acc_limpieza_0_4_pron$pron_df$y,
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(limpieza_forecast_tb$out)
+limpieza_forecast_tb$ds[limpieza_forecast_tb$out == 1]
+
+acc_limpieza_prophet_plot <- generate_prophet_plot(acc_limpieza_0_4$ts_train, 
+                      acc_limpieza_0_4$ts_test, 
+                      forecast_tb = acc_limpieza_prophet$forecast_tb_list[[acc_limpieza_sel_prophet]])
+
+(intox_limpieza_both_metrics <- combine_model_metrics(acc_limpieza_0_4_arima_sel_df, 
+          acc_limpieza_prophet$acc_consolidated[acc_limpieza_sel_prophet,]) %>% 
+    mutate_if(is.numeric, ~round(., 2)) %>% 
+    select(Modelo, RMSE, MAPE) %>% 
+  arrange(RMSE, MAPE))
+
+
+intox_limpieza_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "1.11.Limpieza_proph_arima.rtf"))
+intox_limpieza_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "1.11.Limpieza_proph_arima.tex"))
+```  
+  
+#### Gráficos de pronóstico
+  
+```{r}
+library(cowplot)
+limpieza_plots_aligned  <- align_plots(acc_limpieza_0_4_pron$arima_plot + theme(legend.position = "none")  + ggtitle('ARIMA (1,0,0)'), 
+                     acc_limpieza_prophet_plot + theme(legend.position = "none")  + ggtitle('Prophet'),
+                     align = 'v', 
+                     axis = 'l')
+
+limpieza_arima_legend <- get_legend(acc_limpieza_0_4_pron$arima_plot)
+
+(limpieza_final_plot <- cowplot::plot_grid(limpieza_plots_aligned[[1]], 
+                   limpieza_plots_aligned[[2]], 
+                  limpieza_arima_legend, 
+                  label_size = 10,
+                  rel_heights =  c(1, 1, .1),
+                  nrow = 3))
+
+png(filename = file.path(img_folder, "1.11.Limpieza_pron_final.png"),
+    width = 720, height = 520, units = "px")
+limpieza_final_plot
+dev.off()
+```
+  
+### Medicamentos - 0 a 4 años  
+  
+```{r}
+acc_meds_0_4 <- get_ts_from_agg_df(agg_intox_accidental4, 
+                                   filtro_etario = "0 a 4 años",
+                                   filtro_toxico = "Medicamentos")
+(acc_meds_prop <- sum(acc_meds_0_4$ts_full)/nrow(intox_accidental))
+
+acc_meds_0_4_tsibble <- acc_meds_0_4$agg_data %>% 
+  as_tsibble(index = TIEMPO) %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO))
+
+acc_meds_0_4_train <- acc_meds_0_4_tsibble %>% 
+  filter(TIEMPO < tsibble::yearmonth("2020-03"))
+acc_meds_0_4_test <- acc_meds_0_4_tsibble %>% 
+  filter(TIEMPO >= tsibble::yearmonth("2020-03"))
+```
+  
+#### Changepoint - Enfoque cambio de nivel
+
+```{r}
+acc_meds_cpts <- get_change_points(acc_meds_0_4$ts_full)
+acc_meds_cpts$cp_plot
+```
+  
+#### Outliers - Enfoque de valores extremos  
+  
+```{r}
+acc_meds_outliers <- forecast::tsoutliers(acc_meds_0_4$ts_full, lambda = NULL, iterate = 100)
+zoo::as.Date(acc_meds_0_4$ts_full)[acc_meds_outliers$index]
+```
+  
+### ARIMA - Enfoque Intervencion  
+  
+#### Estacionariedad y Autocorrelogramas Intervención   
+  
+A pesar de que el método sugiere una diferenciación  
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+# DescTools::PlotACF(acc_meds_0_4$ts_full, main = "")
+
+acc_meds_0_4_tsibble %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+acc_meds_0_4_tsibble |>
+  features(TOTAL, unitroot_nsdiffs)
+
+acc_meds_0_4_tsibble |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+acc_meds_0_4_tsibble |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+acc_meds_0_4_tsibble |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+acc_meds_0_4_tsibble |>
+  gg_tsdisplay_spanish(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+acc_meds_0_4_tsibble |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  labs(title = "Diferenciado", y="")
+
+png(filename = file.path(img_folder, "1.13.Medicamentos.png"),
+    width = 720, height = 480, units = "px")
+acc_meds_0_4_tsibble |>
+  gg_tsdisplay_spanish(TOTAL, plot_type='partial', lag=36) +
+  ylab("Total de Casos")
+dev.off()
+```  
+  
+#### Modelaje Intervención  
+  
+##### Selección del Modelo  
+  
+```{r}
+inter <- c(rep(0, 62), rep(1, 34))
+timeperiod <- 96
+
+# acc_meds_0_4_inter_model <- acc_meds_0_4_tsibble %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE))
+
+acc_meds_0_4_inter_model_dif <- acc_meds_0_4_tsibble %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_010 = ARIMA(TOTAL ~ pdq(0,1,0) + inter + PDQ(0,0,0)),
+    arima_110 = ARIMA(TOTAL ~ pdq(1,1,0) + inter + PDQ(0,0,0)),
+    arima_210 = ARIMA(TOTAL ~ pdq(2,1,0) + inter + PDQ(0,0,0)),
+    arima_011 = ARIMA(TOTAL ~ pdq(0,1,1) + inter + PDQ(0,0,0)),
+    arima_111 = ARIMA(TOTAL ~ pdq(1,1,1) + inter + PDQ(0,0,0)),
+    arima_211 = ARIMA(TOTAL ~ pdq(2,1,1) + inter + PDQ(0,0,0)),
+
+    arima_010_100_3 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 3) + inter),
+    arima_110_100_3 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 3) + inter),
+    arima_210_100_3 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,0, period = 3) + inter),
+    arima_011_100_3 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 3) + inter),
+    arima_111_100_3 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 3) + inter),
+    arima_211_100_3 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,0, period = 3) + inter),
+    
+    arima_010_100_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 6) + inter),
+    arima_110_100_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 6) + inter),
+    arima_210_100_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,0, period = 6) + inter),
+    arima_011_100_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 6) + inter),
+    arima_111_100_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 6) + inter),
+    arima_211_100_6 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,0, period = 6) + inter),
+    
+    arima_010_100_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_110_100_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_210_100_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_011_100_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_111_100_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_211_100_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,0, period = 12) + inter),
+  )
+
+acc_meds_0_4_inter_model <- acc_meds_0_4_tsibble %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_202_auto = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(0,0,0) + inter), 
+    arima_000 = ARIMA(TOTAL ~ pdq(0,0,0) + inter + PDQ(0,0,0)),
+    arima_100 = ARIMA(TOTAL ~ pdq(1,0,0) + inter + PDQ(0,0,0)),
+    arima_001 = ARIMA(TOTAL ~ pdq(0,0,1) + inter + PDQ(0,0,0)),
+    arima_101 = ARIMA(TOTAL ~ pdq(1,0,1) + inter + PDQ(0,0,0)),
+    arima_200 = ARIMA(TOTAL ~ pdq(2,0,0) + inter + PDQ(0,0,0)),
+    arima_002 = ARIMA(TOTAL ~ pdq(0,0,2) + inter + PDQ(0,0,0)),
+    arima_201 = ARIMA(TOTAL ~ pdq(2,0,1) + inter + PDQ(0,0,0)),
+    arima_102 = ARIMA(TOTAL ~ pdq(1,0,2) + inter + PDQ(0,0,0)),
+    arima_202 = ARIMA(TOTAL ~ pdq(2,0,2) + inter + PDQ(0,0,0)),
+    arima_003 = ARIMA(TOTAL ~ pdq(0,0,3) + inter + PDQ(0,0,0)),
+    arima_103 = ARIMA(TOTAL ~ pdq(1,0,3) + inter + PDQ(0,0,0)),
+    arima_203 = ARIMA(TOTAL ~ pdq(2,0,3) + inter + PDQ(0,0,0)),
+    
+    arima_000_100_6 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(1,0,0, period = 6) + inter),
+    arima_100_100_6 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(1,0,0, period = 6) + inter),
+    arima_001_100_6 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(1,0,0, period = 6) + inter),
+    arima_101_100_6 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(1,0,0, period = 6) + inter),
+    arima_200_100_6 = ARIMA(TOTAL ~ pdq(2,0,0) + PDQ(1,0,0, period = 6) + inter),
+    arima_002_100_6 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(1,0,0, period = 6) + inter),
+    arima_201_100_6 = ARIMA(TOTAL ~ pdq(2,0,1) + PDQ(1,0,0, period = 6) + inter),
+    arima_102_100_6 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(1,0,0, period = 6) + inter),
+    arima_202_100_6 = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(1,0,0, period = 6) + inter),
+    arima_003_100_6 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(1,0,0, period = 6) + inter),
+    arima_103_100_6 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(1,0,0, period = 6) + inter),
+    arima_203_100_6 = ARIMA(TOTAL ~ pdq(2,0,3) + PDQ(1,0,0, period = 6) + inter),
+    
+    arima_000_001_6 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_100_001_6 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_001_001_6 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,0,1, period = 6) + inter),
+    arima_101_001_6 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,0,1, period = 6) + inter),
+    arima_200_001_6 = ARIMA(TOTAL ~ pdq(2,0,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_002_001_6 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(0,0,1, period = 6) + inter),
+    arima_201_001_6 = ARIMA(TOTAL ~ pdq(2,0,1) + PDQ(0,0,1, period = 6) + inter),
+    arima_102_001_6 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(0,0,1, period = 6) + inter),
+    arima_202_001_6 = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(0,0,1, period = 6) + inter),
+    arima_003_001_6 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(0,0,1, period = 6) + inter),
+    arima_103_001_6 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(0,0,1, period = 6) + inter),
+    arima_203_001_6 = ARIMA(TOTAL ~ pdq(2,0,3) + PDQ(0,0,1, period = 6) + inter),
+    
+    arima_000_101_6 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(1,0,1, period = 6) + inter),
+    arima_100_101_6 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(1,0,1, period = 6) + inter),
+    arima_001_101_6 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(1,0,1, period = 6) + inter),
+    arima_101_101_6 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(1,0,1, period = 6) + inter),
+    arima_200_101_6 = ARIMA(TOTAL ~ pdq(2,0,0) + PDQ(1,0,1, period = 6) + inter),
+    arima_002_101_6 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(1,0,1, period = 6) + inter),
+    arima_201_101_6 = ARIMA(TOTAL ~ pdq(2,0,1) + PDQ(1,0,1, period = 6) + inter),
+    arima_102_101_6 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(1,0,1, period = 6) + inter),
+    arima_202_101_6 = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(1,0,1, period = 6) + inter),
+    arima_003_101_6 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(1,0,1, period = 6) + inter),
+    arima_103_101_6 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(1,0,1, period = 6) + inter),
+    arima_203_101_6 = ARIMA(TOTAL ~ pdq(2,0,3) + PDQ(1,0,1, period = 6) + inter),
+    
+    arima_000_100_12 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_100_100_12 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_001_100_12 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_101_100_12 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_200_100_12 = ARIMA(TOTAL ~ pdq(2,0,0) + PDQ(1,0,0, period = 12) + inter),
+    arima_002_100_12 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(1,0,0, period = 12) + inter),
+    arima_201_100_12 = ARIMA(TOTAL ~ pdq(2,0,1) + PDQ(1,0,0, period = 12) + inter),
+    arima_102_100_12 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(1,0,0, period = 12) + inter),
+    arima_202_100_12 = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(1,0,0, period = 12) + inter),
+    arima_003_100_12 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(1,0,0, period = 12) + inter),
+    arima_103_100_12 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(1,0,0, period = 12) + inter),
+    arima_203_100_12 = ARIMA(TOTAL ~ pdq(2,0,3) + PDQ(1,0,0, period = 12) + inter),
+    
+    arima_000_001_12 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_100_001_12 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_001_001_12 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,0,1, period = 12) + inter),
+    arima_101_001_12 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,0,1, period = 12) + inter),
+    arima_200_001_12 = ARIMA(TOTAL ~ pdq(2,0,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_002_001_12 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(0,0,1, period = 12) + inter),
+    arima_201_001_12 = ARIMA(TOTAL ~ pdq(2,0,1) + PDQ(0,0,1, period = 12) + inter),
+    arima_102_001_12 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(0,0,1, period = 12) + inter),
+    arima_202_001_12 = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(0,0,1, period = 12) + inter),
+    arima_003_001_12 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(0,0,1, period = 12) + inter),
+    arima_103_001_12 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(0,0,1, period = 12) + inter),
+    arima_203_001_12 = ARIMA(TOTAL ~ pdq(2,0,3) + PDQ(0,0,1, period = 12) + inter),
+    
+    arima_000_101_12 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(1,0,1, period = 12) + inter),
+    arima_100_101_12 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(1,0,1, period = 12) + inter),
+    arima_001_101_12 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(1,0,1, period = 12) + inter),
+    arima_101_101_12 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(1,0,1, period = 12) + inter),
+    arima_200_101_12 = ARIMA(TOTAL ~ pdq(2,0,0) + PDQ(1,0,1, period = 12) + inter),
+    arima_002_101_12 = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(1,0,1, period = 12) + inter),
+    arima_201_101_12 = ARIMA(TOTAL ~ pdq(2,0,1) + PDQ(1,0,1, period = 12) + inter),
+    arima_102_101_12 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(1,0,1, period = 12) + inter),
+    arima_202_101_12 = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(1,0,1, period = 12) + inter),
+    arima_003_101_12 = ARIMA(TOTAL ~ pdq(0,0,3) + PDQ(1,0,1, period = 12) + inter),
+    arima_103_101_12 = ARIMA(TOTAL ~ pdq(1,0,3) + PDQ(1,0,1, period = 12) + inter),
+    arima_203_101_12 = ARIMA(TOTAL ~ pdq(2,0,3) + PDQ(1,0,1, period = 12) + inter)
+  )
+
+acc_meds_0_4_inter_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(acc_meds_0_4_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+glance(acc_meds_0_4_inter_model_dif) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(meds_arima_table <- glance(acc_meds_0_4_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ) %>% 
+  arrange(desc(str_detect(Modelo, "auto"))))
+
+meds_arima_int_gt <- meds_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+meds_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.13.Meds_arima_int.rtf"))
+meds_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.13.Meds_arima_int.tex"))
+
+# El ARIMA (0,1,1)(1,0,0) se descarta porque el componente estacional no es significativo.
+# Se compara con el ARIMA 202 usando el sigma2 y se elige el 202.
+
+acc_meds_0_4_inter_sel_model <- acc_meds_0_4_inter_model |>
+  select(arima_202)
+
+acc_meds_0_4_inter_sel_model |>
+  report()
+
+meds_arima_gt <- acc_meds_0_4_inter_sel_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "inter" ~ "Intervención",
+      term == "intercept" ~ "Intercepto",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+meds_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.14.Meds_arima_int_mod.rtf"))
+meds_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.14.Meds_arima_int_mod.tex"))
+
+
+acc_meds_0_4_inter_sel_model |> 
+  gg_tsresiduals(lag=timeperiod)
+
+png(filename = file.path(img_folder, "1.15.Meds_int_resids.png"),
+    width = 720, height = 480, units = "px")
+acc_meds_0_4_inter_sel_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+```
+  
+##### Verificación de Supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(acc_meds_0_4_inter_lb <- augment(acc_meds_0_4_inter_model) |>
+  filter(.model == "arima_202_auto") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 4))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+  
+###### Raíces Unitarias  
+  
+```{r}
+acc_meds_0_4_inter_sel_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "1.14.Meds_int_roots.png"),
+    width = 720, height = 480, units = "px")
+acc_meds_0_4_inter_sel_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+  
+###### Normalidad de los residuos  
+  
+```{r}
+# Normalidad de Residuos - ARIMA
+acc_meds_0_4_inter_ts_residuals <- residuals(acc_meds_0_4_inter_sel_model, 
+                                    type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(acc_meds_0_4_inter_ts_residuals)
+
+(acc_meds_0_4_inter_jb_arima <- tseries::jarque.bera.test(acc_meds_0_4_inter_ts_residuals))
+
+(acc_meds_0_4_inter_shap_arima <-shapiro.test(acc_meds_0_4_inter_ts_residuals))
+
+car::qqPlot(acc_meds_0_4_inter_ts_residuals)
+
+# Normalidad de residuos - Regresion
+acc_meds_0_4_inter_reg_residuals <- residuals(acc_meds_0_4_inter_sel_model, type = "regression") %>% as_tibble() %>% pull(.resid)
+
+mean(acc_meds_0_4_inter_reg_residuals)
+
+(acc_meds_0_4_inter_shap_reg <- shapiro.test(acc_meds_0_4_inter_reg_residuals))
+
+car::qqPlot(acc_meds_0_4_inter_reg_residuals)
+
+# Visualizacion ambos graficos
+bind_rows(
+    `Regression residuals` =
+        as_tibble(residuals(acc_meds_0_4_inter_sel_model, type = "regression")),
+    `ARIMA residuals` =
+        as_tibble(residuals(acc_meds_0_4_inter_sel_model, type = "innovation")),
+    .id = "type"
+  ) |>
+  mutate(
+    TIEMPO = as_date(TIEMPO)
+  ) |>
+  ggplot(aes(x = TIEMPO, y = .resid)) +
+  geom_line() +
+  facet_grid(vars(type))
+```
+  
+##### Agrupación de resultados  
+  
+```{r}
+(summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Accidental por Medicamentos",
+    Población = "Menores de 4 años",
+    Enfoque = "Intervención",
+    Modelo = "Regresion con ARIMA (2,0,2)",
+    # Significancia_intervencion = "Si",
+    # ACF_Residuales = "Todos dentro",
+    # Histograma = "Aproximadamente Normal",
+    Residuals_LJung_Box_Test_ARIMA = round(acc_meds_0_4_inter_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(acc_meds_0_4_inter_jb_arima$p.value, 2),
+    # Residuals_Shapiro_Test_ARIMA = round(acc_meds_0_4_inter_shap_arima$p.value, 2),
+    Residuals_Shapiro_Wilk_Regression = round(acc_meds_0_4_inter_shap_reg$p.value, 2)
+  )))
+```  
+
+#### ARIMA - Enfoque Pronostico  
+  
+#### Estacionariedad y Autocorrelogramas Pronóstico   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+acc_meds_0_4_train %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+acc_meds_0_4_train |>
+  features(TOTAL, unitroot_nsdiffs)
+
+acc_meds_0_4_train |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+acc_meds_0_4_train |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+acc_meds_0_4_train |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+acc_meds_0_4_train |>
+  gg_tsdisplay_spanish(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+png(filename = file.path(img_folder, "1.16.Meds_pron_dif.png"),
+    width = 720, height = 480, units = "px")
+acc_meds_0_4_train |>
+  gg_tsdisplay_spanish(TOTAL,
+               plot_type='partial', lag=36) +
+  ylab("Total Casos")
+dev.off()
+```    
+  
+#### Modelaje Pronóstico     
+  
+##### Selección del Modelo  
+  
+```{r}
+# acc_meds_0_4_pron_model <- acc_meds_0_4_train %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE))
+# 
+# acc_meds_0_4_pron_model |>
+#   pivot_longer(everything(),
+#                names_to = "Model name",
+#                values_to = "Orders")
+
+acc_meds_0_4_pron_model <- acc_meds_0_4_train %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_100_auto = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,0,0)),
+    arima_000 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,0,0)),
+    arima_001 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,0,0)),
+    arima_100 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,0,0)),
+    arima_101 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,0,0))
+  )
+
+acc_meds_0_4_pron_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(acc_meds_0_4_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(meds_pron_arima_table <- glance(acc_meds_0_4_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ) %>% 
+  slice(-1))
+
+meds_arima_pron_gt <- meds_pron_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+meds_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.15.Meds_arima_pron.rtf"))
+meds_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.15.Meds_arima_pron.tex"))
+
+acc_meds_0_4_final_arima_model <- acc_meds_0_4_pron_model |>
+  select(arima_100_auto) 
+
+acc_meds_0_4_final_arima_model |>
+  report()
+
+meds_arima_gt <- acc_meds_0_4_final_arima_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "constant" ~ "Constante",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+meds_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.16.Meds_arima_pron_mod.rtf"))
+meds_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.16.Meds_arima_pron_mod.tex"))
+
+acc_meds_0_4_final_arima_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+
+png(filename = file.path(img_folder, "1.18.Meds_pron_resids.png"),
+    width = 720, height = 480, units = "px")
+acc_meds_0_4_final_arima_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+```
+  
+##### Verificación de supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(acc_meds_0_4_lb <-  augment(acc_meds_0_4_pron_model) |>
+  filter(.model == "arima_100_auto") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 1))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+   
+###### Raíces Unitarias
+   
+```{r}
+acc_meds_0_4_final_arima_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "1.17.Meds_pron_roots.png"),
+    width = 720, height = 480, units = "px")
+acc_meds_0_4_final_arima_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+   
+###### Normalidad de los residuos   
+   
+```{r}
+# Normalidad de Residuos - ARIMA
+acc_meds_0_4_residuals <- residuals(acc_meds_0_4_final_arima_model, type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(acc_meds_0_4_residuals)
+
+(acc_meds_0_4_jb_arima <- tseries::jarque.bera.test(acc_meds_0_4_residuals))
+
+(acc_meds_0_4_shap_arima <- shapiro.test(acc_meds_0_4_residuals))
+
+car::qqPlot(acc_meds_0_4_residuals)
+```
+   
+##### Agrupación de Resultados   
+   
+```{r}
+acc_meds_0_4_pron <- gen_pronostic_plot2(acc_meds_0_4_train, 
+                                      acc_meds_0_4_test,
+                                      acc_meds_0_4_final_arima_model,
+                                      h_forecast = 34)
+acc_meds_0_4_pron$pron_df <- acc_meds_0_4_pron$pron_df %>% 
+  mutate(
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(acc_meds_0_4_pron$pron_df$out)
+acc_meds_0_4_pron$pron_df$ds[acc_meds_0_4_pron$pron_df$out == 1]
+
+acc_meds_0_4_arima_sel_df <- forecast::accuracy(acc_meds_0_4_pron$pron_df$yhat,
+                                                    acc_meds_0_4_pron$pron_df$y) %>%
+  as_tibble() %>% 
+  mutate(Modelo = "ARIMA (1,0,0)",
+         Metric_Type = "Test set")
+
+summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Accidental por Medicamentos",
+    Población = "Menores de 4 años",
+    Enfoque = "Pronóstico",
+    Modelo = "ARIMA (1,0,0)",
+    # ACF_Residuales = "Todos dentro",
+    # Histograma = "Aproximadamente Normal",
+    Residuals_LJung_Box_Test_ARIMA = round(acc_meds_0_4_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(acc_meds_0_4_jb_arima$p.value, 2),
+    # Residuals_Shapiro_Test_ARIMA = round(acc_meds_0_4_shap_arima$p.value, 2)
+  ))
+```
+  
+#### Prophet - Enfoque Pronóstico
+  
+```{r}
+# acc_meds_prophet_mod <- generate_prophet_forecast(acc_meds_0_4$ts_train,
+#                                               acc_meds_0_4$ts_test,
+#                                               periods = 34)
+# write_rds(acc_meds_prophet_mod, "modelos/acc_meds_prophet.RDS")
+acc_meds_prophet <- read_rds("modelos/acc_meds_prophet.RDS")
+
+acc_meds_prophet$acc_consolidated %>%
+  mutate(model = 1:nrow(acc_meds_prophet$acc_consolidated)) %>% 
+  arrange(RMSE, MAPE)
+
+acc_meds_sel_prophet <- 20
+acc_meds_forecast_tb <- acc_meds_prophet$forecast_tb_list[[acc_meds_sel_prophet]] %>% 
+  mutate(
+    y = acc_meds_0_4_pron$pron_df$y,
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(acc_meds_forecast_tb$out)
+acc_meds_forecast_tb$ds[acc_meds_forecast_tb$out == 1]
+
+acc_meds_prophet_plot <- generate_prophet_plot(acc_meds_0_4$ts_train, 
+                      acc_meds_0_4$ts_test, 
+                      forecast_tb = acc_meds_prophet$forecast_tb_list[[acc_meds_sel_prophet]])
+
+(acc_meds_both_metrics <- combine_model_metrics(acc_meds_0_4_arima_sel_df, 
+                      acc_meds_prophet$acc_consolidated[acc_meds_sel_prophet,]) %>%   mutate_if(is.numeric, ~round(., 2)) %>% 
+  select(Modelo, RMSE, MAPE) %>% 
+  arrange(RMSE, MAPE))
+
+acc_meds_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "1.17.Meds_proph_arima.rtf"))
+acc_meds_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "1.17.Meds_proph_arima.tex"))
+```  
+  
+#### Gráficos de pronóstico
+  
+```{r}
+cowplot::plot_grid(acc_meds_0_4_pron$arima_plot, 
+                   acc_meds_prophet_plot, 
+                   labels = c('Arima', 'Prophet'))
+
+library(cowplot)
+acc_meds_plots_aligned  <- align_plots(acc_meds_0_4_pron$arima_plot + theme(legend.position = "none")  + ggtitle('ARIMA (1,0,0)'), 
+                     acc_meds_prophet_plot + theme(legend.position = "none")  + ggtitle('Prophet'),
+                     align = 'v', 
+                     axis = 'l')
+
+meds_arima_legend <- get_legend(acc_meds_0_4_pron$arima_plot)
+
+(acc_meds_final_plot <- cowplot::plot_grid(acc_meds_plots_aligned[[1]], 
+                   acc_meds_plots_aligned[[2]], 
+                  meds_arima_legend, 
+                  label_size = 10,
+                  rel_heights =  c(1, 1, .1),
+                  nrow = 3))
+
+png(filename = file.path(img_folder, "1.19.Meds_pron_final.png"),
+    width = 720, height = 520, units = "px")
+acc_meds_final_plot
+dev.off()
+```
+  
+### Hogar y Recreacion - 0 a 4 años  
+  
+```{r}
+acc_hogar_0_4 <- get_ts_from_agg_df(agg_intox_accidental4, 
+                                   filtro_etario = "0 a 4 años",
+                                   filtro_toxico = "Hogar y Recreacion")
+(acc_hogar_prop <- sum(acc_hogar_0_4$ts_full)/nrow(intox_accidental))
+
+acc_hogar_0_4_tsibble <- acc_hogar_0_4$agg_data %>% 
+  as_tsibble(index = TIEMPO) %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO))
+
+acc_hogar_0_4_train <- acc_hogar_0_4_tsibble %>% 
+  filter(TIEMPO < tsibble::yearmonth("2020-03"))
+acc_hogar_0_4_test <- acc_hogar_0_4_tsibble %>% 
+  filter(TIEMPO >= tsibble::yearmonth("2020-03"))
+```
+  
+#### Changepoint - Enfoque cambio de nivel
+
+```{r}
+acc_hogar_cpts <- get_change_points(acc_hogar_0_4$ts_full)
+acc_hogar_cpts$cp_plot
+```
+  
+#### Outliers - Enfoque de valores extremos  
+  
+```{r}
+acc_hogar_outliers <- forecast::tsoutliers(acc_hogar_0_4$ts_full, lambda = NULL, iterate = 100)
+zoo::as.Date(acc_hogar_0_4$ts_full)[acc_hogar_outliers$index]
+```
+  
+### ARIMA - Enfoque Intervencion  
+  
+#### Estacionariedad y Autocorrelogramas Intervención   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+# DescTools::PlotACF(acc_hogar_0_4$ts_full, main = "") 
+
+acc_hogar_0_4_tsibble %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+acc_hogar_0_4_tsibble |>
+  features(TOTAL, unitroot_nsdiffs)
+
+acc_hogar_0_4_tsibble |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+acc_hogar_0_4_tsibble |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+acc_hogar_0_4_tsibble |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+acc_hogar_0_4_tsibble |>
+  gg_tsdisplay_spanish(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+acc_hogar_0_4_tsibble |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  labs(title = "Diferenciado", y="")
+
+png(filename = file.path(img_folder, "1.20.Hogar_int.png"),
+    width = 720, height = 480, units = "px")
+acc_hogar_0_4_tsibble |>
+  gg_tsdisplay(difference(TOTAL),
+               plot_type='partial', lag=36)  +
+  ylab("Total Diferenciado (1)")
+dev.off()
+```  
+  
+#### Modelaje Intervención  
+  
+##### Selección del Modelo  
+  
+```{r}
+inter <- c(rep(0, 62), rep(1, 34))
+timeperiod <- 96
+
+# acc_hogar_0_4_inter_model <- acc_hogar_0_4_tsibble %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE))
+
+acc_hogar_0_4_inter_model <- acc_hogar_0_4_tsibble %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_001_auto = ARIMA(TOTAL ~ pdq(0,0,1) + inter + PDQ(0,0,0)),
+    arima_000 = ARIMA(TOTAL ~ pdq(0,0,0) + inter + PDQ(0,0,0)),
+    arima_001 = ARIMA(TOTAL ~ pdq(0,0,1) + inter + PDQ(0,0,0)),
+    arima_100 = ARIMA(TOTAL ~ pdq(1,0,0) + inter + PDQ(0,0,0)),
+    arima_101 = ARIMA(TOTAL ~ pdq(1,0,1) + inter + PDQ(0,0,0)),
+    
+    arima_000_100_3 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(1,0,0, period = 3) + inter),
+    arima_100_100_3 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(1,0,0, period = 3) + inter),
+    arima_001_100_3 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(1,0,0, period = 3) + inter),
+    arima_101_100_3 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(1,0,0, period = 3) + inter),
+    
+    arima_000_001_3 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,0,1, period = 3) + inter),
+    arima_100_001_3 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,0,1, period = 3) + inter),
+    arima_001_001_3 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,0,1, period = 3) + inter),
+    arima_101_001_3 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,0,1, period = 3) + inter),
+    
+    arima_000_101_3 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(1,0,1, period = 3) + inter),
+    arima_100_101_3 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(1,0,1, period = 3) + inter),
+    arima_001_101_3 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(1,0,1, period = 3) + inter),
+    arima_101_101_3 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(1,0,1, period = 3) + inter)
+  )
+
+acc_hogar_0_4_inter_model_dif <- acc_hogar_0_4_tsibble %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_010 = ARIMA(TOTAL ~ pdq(0,1,0) + inter + PDQ(0,0,0)),
+    arima_011 = ARIMA(TOTAL ~ pdq(0,1,1) + inter + PDQ(0,0,0)),
+    arima_110 = ARIMA(TOTAL ~ pdq(1,1,0) + inter + PDQ(0,0,0)),
+    arima_111 = ARIMA(TOTAL ~ pdq(1,1,1) + inter + PDQ(0,0,0)),
+    arima_210 = ARIMA(TOTAL ~ pdq(2,1,0) + inter + PDQ(0,0,0)),
+    arima_012 = ARIMA(TOTAL ~ pdq(0,1,2) + inter + PDQ(0,0,0)),
+    arima_211 = ARIMA(TOTAL ~ pdq(2,1,1) + inter + PDQ(0,0,0)),
+    arima_112 = ARIMA(TOTAL ~ pdq(1,1,2) + inter + PDQ(0,0,0)),
+    arima_212 = ARIMA(TOTAL ~ pdq(2,1,2) + inter + PDQ(0,0,0)),
+    arima_013 = ARIMA(TOTAL ~ pdq(3,1,0) + inter + PDQ(0,0,0)),
+    arima_113 = ARIMA(TOTAL ~ pdq(3,1,1) + inter + PDQ(0,0,0)),
+    arima_213 = ARIMA(TOTAL ~ pdq(3,1,2) + inter + PDQ(0,0,0)),
+  )
+
+acc_hogar_0_4_inter_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(acc_hogar_0_4_inter_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+glance(acc_hogar_0_4_inter_model_dif) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(hogar_arima_table <- glance(acc_hogar_0_4_inter_model_dif) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ))
+
+hogar_arima_int_gt <- hogar_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+hogar_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.18.Hogar_arima_int.rtf"))
+hogar_arima_int_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.18.Hogar_arima_int.tex"))
+
+acc_hogar_0_4_inter_sel_model <- acc_hogar_0_4_inter_model_dif |>
+  select(arima_011)
+
+# arima_001_001_3 componente estacional no significativo
+# arima_001_101_3 componente estacional no significativo
+# arima_100_101_3 componente no estacional no significativo
+# arima_100_001_3 componente estacional no significativo
+# arima_001_100_3 componente estacional no significativo
+# arima_011 significativo con menor sigma2
+
+acc_hogar_0_4_inter_sel_model |>
+  report()
+
+hogar_arima_gt <- acc_hogar_0_4_inter_sel_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "inter" ~ "Intervención",
+      term == "intercept" ~ "Intercepto",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+hogar_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.19.Hogar_arima_int_mod.rtf"))
+hogar_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.19.Hogar_arima_int_mod.tex"))
+
+png(filename = file.path(img_folder, "1.22.Hogar_int_resids.png"),
+    width = 720, height = 480, units = "px")
+acc_hogar_0_4_inter_sel_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+
+acc_hogar_0_4_inter_sel_model |> 
+  gg_tsresiduals(lag=timeperiod)
+```
+  
+##### Verificación de Supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(acc_hogar_0_4_inter_lb <- augment(acc_hogar_0_4_inter_model_dif) |>
+  filter(.model == "arima_011") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 1))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+  
+###### Raíces Unitarias  
+  
+```{r}
+acc_hogar_0_4_inter_sel_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "1.21.Hogar_int_roots.png"),
+    width = 720, height = 480, units = "px")
+acc_hogar_0_4_inter_sel_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+  
+###### Normalidad de los residuos  
+  
+```{r}
+# Normalidad de Residuos - ARIMA
+acc_hogar_0_4_inter_ts_residuals <- residuals(acc_hogar_0_4_inter_sel_model, 
+                                    type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(acc_hogar_0_4_inter_ts_residuals)
+
+(acc_hogar_0_4_inter_jb_arima <- tseries::jarque.bera.test(acc_hogar_0_4_inter_ts_residuals))
+
+(acc_hogar_0_4_inter_shap_arima <-shapiro.test(acc_hogar_0_4_inter_ts_residuals))
+
+car::qqPlot(acc_hogar_0_4_inter_ts_residuals)
+
+# Normalidad de residuos - Regresion
+acc_hogar_0_4_inter_reg_residuals <- residuals(acc_hogar_0_4_inter_sel_model, type = "regression") %>% as_tibble() %>% pull(.resid)
+
+mean(acc_hogar_0_4_inter_reg_residuals)
+
+(acc_hogar_0_4_inter_shap_reg <- shapiro.test(acc_hogar_0_4_inter_reg_residuals))
+
+car::qqPlot(acc_hogar_0_4_inter_reg_residuals)
+
+# Visualizacion ambos graficos
+bind_rows(
+    `Regression residuals` =
+        as_tibble(residuals(acc_hogar_0_4_inter_sel_model, type = "regression")),
+    `ARIMA residuals` =
+        as_tibble(residuals(acc_hogar_0_4_inter_sel_model, type = "innovation")),
+    .id = "type"
+  ) |>
+  mutate(
+    TIEMPO = as_date(TIEMPO)
+  ) |>
+  ggplot(aes(x = TIEMPO, y = .resid)) +
+  geom_line() +
+  facet_grid(vars(type))
+```
+  
+##### Agrupación de resultados  
+  
+```{r}
+(summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Accidental por productos del hogar y recreación",
+    Población = "menores de 4 años",
+    Enfoque = "Intervención",
+    # Significancia_intervencion = "No",
+    # ACF_Residuales = "Todos dentro",
+    # Histograma = "Aproximadamente Normal",
+    Residuals_LJung_Box_Test_ARIMA = round(acc_hogar_0_4_inter_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(acc_hogar_0_4_inter_jb_arima$p.value, 2),
+    # Residuals_Shapiro_Test_ARIMA = round(acc_hogar_0_4_inter_shap_arima$p.value, 2),
+    Residuals_Shapiro_Wilk_Regression = round(acc_hogar_0_4_inter_shap_reg$p.value, 2)
+  )))
+```
+  
+#### ARIMA - Enfoque Pronostico  
+  
+#### Estacionariedad y Autocorrelogramas Pronóstico   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+acc_hogar_0_4_train %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+acc_hogar_0_4_train |>
+  features(TOTAL, unitroot_nsdiffs)
+
+acc_hogar_0_4_train |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+acc_hogar_0_4_train |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+acc_hogar_0_4_train |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+acc_hogar_0_4_train |>
+  gg_tsdisplay_spanish(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+png(filename = file.path(img_folder, "1.23.Hogar_pron_dif.png"),
+    width = 720, height = 480, units = "px")
+acc_hogar_0_4_train |>
+  gg_tsdisplay(TOTAL,
+               plot_type='partial', lag=36) +
+  ylab("Total Casos")
+dev.off()
+```    
+  
+#### Modelaje Pronóstico     
+  
+##### Selección del Modelo  
+  
+```{r}
+# acc_hogar_0_4_pron_model <- acc_hogar_0_4_train %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE))
+# 
+# acc_hogar_0_4_pron_model |>
+#   pivot_longer(everything(),
+#                names_to = "Model name",
+#                values_to = "Orders")
+
+acc_hogar_0_4_pron_model <- acc_hogar_0_4_train %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_000 = ARIMA(TOTAL ~ pdq(0,0,0) + PDQ(0,0,0)),
+    arima_001 = ARIMA(TOTAL ~ pdq(0,0,1) + PDQ(0,0,0)),
+    arima_100 = ARIMA(TOTAL ~ pdq(1,0,0) + PDQ(0,0,0)),
+    arima_101 = ARIMA(TOTAL ~ pdq(1,0,1) + PDQ(0,0,0)),
+    arima_002_auto = ARIMA(TOTAL ~ pdq(0,0,2) + PDQ(0,0,0)),
+    arima_200 = ARIMA(TOTAL ~ pdq(2,0,0) + PDQ(0,0,0)),
+    arima_102 = ARIMA(TOTAL ~ pdq(1,0,2) + PDQ(0,0,0)),
+    arima_201 = ARIMA(TOTAL ~ pdq(2,0,1) + PDQ(0,0,0)),
+    arima_202 = ARIMA(TOTAL ~ pdq(2,0,2) + PDQ(0,0,0))
+  )
+
+acc_hogar_0_4_pron_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(acc_hogar_0_4_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC)
+
+(hogar_pron_arima_table <- glance(acc_hogar_0_4_pron_model) |> 
+  arrange(BIC) |> 
+  select(.model:BIC) %>% 
+  rename(
+    Modelo = .model,
+    `Log-Verosimilitud` = log_lik,
+  ) %>% 
+  mutate(
+    Modelo = str_replace(Modelo, "arima", "ARIMA"),
+    Modelo = str_replace(Modelo, "_", "("),
+    Modelo = str_replace(Modelo, "_", ")("),
+    Modelo = str_replace(Modelo, "_", ")["),
+    Modelo = case_when(
+      str_detect(Modelo, "\\[") ~ paste0(Modelo, "]"),
+      TRUE ~ paste0(Modelo, ")")
+    )
+  ))
+  
+hogar_arima_pron_gt <- hogar_pron_arima_table %>% 
+  mutate_if(is.numeric, ~round(., 1)) %>% 
+  gt::gt() 
+
+hogar_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.20.Hogar_arima_pron.rtf"))
+hogar_arima_pron_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.20.Hogar_arima_pron.tex"))
+
+acc_hogar_0_4_final_arima_model <- acc_hogar_0_4_pron_model |>
+  select(arima_002_auto) 
+
+acc_hogar_0_4_final_arima_model |>
+  report()
+
+hogar_arima_gt <- acc_hogar_0_4_final_arima_model[[1]][[1]]$fit$par %>% 
+  mutate(
+    term = case_when(
+      term == "constant" ~ "Constante",
+      TRUE ~ str_to_upper(term)
+    )
+  ) %>% 
+  rename(
+    `Parámetro` = term,
+    `Estimación` = estimate,
+    `Error Estándar` = std.error,
+    `Estadístico` = statistic,
+    `Valor p` = p.value
+  ) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  gt::gt() 
+
+hogar_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.21.Hogar_arima_pron_mod.rtf"))
+hogar_arima_gt %>% 
+  gt::gtsave(file.path(tab_folder, "1.21.Hogar_arima_pron_mod.tex"))
+
+png(filename = file.path(img_folder, "1.25.Hogar_pron_resids.png"),
+    width = 720, height = 480, units = "px")
+acc_hogar_0_4_final_arima_model |> 
+  gg_tsresiduals_spanish(lag=timeperiod)
+dev.off()
+
+acc_hogar_0_4_final_arima_model |> 
+  gg_tsresiduals(lag=timeperiod)
+```
+  
+##### Verificación de supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(acc_hogar_0_4_lb <-  augment(acc_hogar_0_4_pron_model) |>
+  filter(.model == "arima_002_auto") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 2))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+   
+###### Raíces Unitarias
+   
+```{r}
+acc_hogar_0_4_final_arima_model |> 
+  gg_arma()
+
+png(filename = file.path(img_folder, "1.24.Hogar_pron_roots.png"),
+    width = 720, height = 480, units = "px")
+acc_hogar_0_4_final_arima_model |> 
+  gg_arma_spanish()
+dev.off()
+```
+   
+###### Normalidad de los residuos   
+   
+```{r}
+# Normalidad de Residuos - ARIMA
+acc_hogar_0_4_residuals <- residuals(acc_hogar_0_4_final_arima_model, type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(acc_hogar_0_4_residuals)
+
+(acc_hogar_0_4_jb_arima <- tseries::jarque.bera.test(acc_hogar_0_4_residuals))
+
+(acc_hogar_0_4_shap_arima <- shapiro.test(acc_hogar_0_4_residuals))
+
+car::qqPlot(acc_hogar_0_4_residuals)
+```
+   
+##### Agrupación de Resultados   
+   
+```{r}
+acc_hogar_0_4_pron <- gen_pronostic_plot2(acc_hogar_0_4_train, 
+                                      acc_hogar_0_4_test,
+                                      acc_hogar_0_4_final_arima_model,
+                                      h_forecast = 34)
+
+acc_hogar_0_4_pron$pron_df <- acc_hogar_0_4_pron$pron_df %>% 
+  mutate(
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(acc_hogar_0_4_pron$pron_df$out)
+acc_hogar_0_4_pron$pron_df$ds[acc_hogar_0_4_pron$pron_df$out == 1]
+
+
+acc_hogar_0_4_arima_sel_df <- forecast::accuracy(acc_hogar_0_4_pron$pron_df$yhat,
+                                                    acc_hogar_0_4_pron$pron_df$y) %>%
+  as_tibble() %>% 
+  mutate(Modelo = "ARIMA (0,0,2)",
+         Metric_Type = "Test set")
+
+summary_arima_mods <- bind_rows(
+  summary_arima_mods,
+  tibble(
+    Causa = "Accidental por productos del hogar y recreación",
+    Población = "Menores de 4 años",
+    Enfoque = "Pronóstico",
+    Modelo = "ARIMA (0,0,2)",
+    # ACF_Residuales = "Todos dentro",
+    # Histograma = "Aproximadamente Normal",
+    Residuals_LJung_Box_Test_ARIMA = round(acc_hogar_0_4_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(acc_hogar_0_4_jb_arima$p.value, 2),
+    # Residuals_Shapiro_Test_ARIMA = round(acc_hogar_0_4_shap_arima$p.value, 2)
+  ))
+```
+  
+#### Prophet - Enfoque Pronóstico
+  
+```{r}
+# acc_hogar_prophet_mod <- generate_prophet_forecast(acc_hogar_0_4$ts_train,
+#                                               acc_hogar_0_4$ts_test,
+#                                               periods = 34)
+# write_rds(acc_hogar_prophet_mod, "modelos/acc_hogar_0_4_prophet.RDS")
+acc_hogar_prophet <- readRDS("modelos/acc_hogar_0_4_prophet.RDS")
+
+acc_hogar_prophet$acc_consolidated %>%
+  mutate(model = 1:nrow(acc_hogar_prophet$acc_consolidated)) %>% 
+  arrange(RMSE, MAPE)
+
+acc_hogar_sel_prophet <- 36
+
+hogar_forecast_tb <- acc_hogar_prophet$forecast_tb_list[[acc_hogar_sel_prophet]] %>% 
+  mutate(
+    y = acc_hogar_0_4_pron$pron_df$y,
+    out = case_when(
+      y >= yhat_upper | y <= yhat_lower ~ 1,
+      TRUE ~ 0
+  ))
+sum(hogar_forecast_tb$out)
+hogar_forecast_tb$ds[hogar_forecast_tb$out == 1]
+
+acc_hogar_prophet_plot <- generate_prophet_plot(acc_hogar_0_4$ts_train, 
+                      acc_hogar_0_4$ts_test, 
+                      forecast_tb = acc_hogar_prophet$forecast_tb_list[[acc_hogar_sel_prophet]])
+
+(hogar_both_metrics <- combine_model_metrics(acc_hogar_0_4_arima_sel_df, 
+                      acc_hogar_prophet$acc_consolidated[acc_hogar_sel_prophet,]) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>% 
+  select(Modelo, RMSE, MAPE) %>% 
+  arrange(RMSE, MAPE))
+
+
+hogar_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "1.23.Hogar_proph_arima.rtf"))
+hogar_both_metrics %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "1.23.Hogar_proph_arima.tex"))
+```
+    
+#### Gráficos de pronóstico
+  
+```{r}
+cowplot::plot_grid(acc_hogar_0_4_pron$arima_plot, 
+                   acc_hogar_prophet_plot, 
+                   labels = c('Arima', 'Prophet'))
+
+library(cowplot)
+hogar_plots_aligned  <- align_plots(acc_hogar_0_4_pron$arima_plot + theme(legend.position = "none")  + ggtitle('ARIMA (002)'), 
+                     acc_hogar_prophet_plot + theme(legend.position = "none")  + ggtitle('Prophet'),
+                     align = 'v', 
+                     axis = 'l')
+
+hogar_arima_legend <- get_legend(acc_hogar_0_4_pron$arima_plot)
+
+(hogar_final_plot <- cowplot::plot_grid(hogar_plots_aligned[[1]], 
+                   hogar_plots_aligned[[2]], 
+                  hogar_arima_legend, 
+                  label_size = 10,
+                  rel_heights =  c(1, 1, .1),
+                  nrow = 3))
+
+png(filename = file.path(img_folder, "1.26.Hogar_pron_final.png"),
+    width = 720, height = 520, units = "px")
+hogar_final_plot
+dev.off()
+```    
+    
+```{r}
+summary_arima_mods %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "1.24.Arima_supuestos.rtf"))
+summary_arima_mods %>% 
+  gt::gt() %>% 
+  gt::gtsave(file.path(tab_folder, "1.24.Arima_supuestos.tex"))
+```
+    
+    
+### Plaguicidas y otros quimicos - 0 a 4 años  
+  
+```{r}
+acc_plag_0_4 <- get_ts_from_agg_df(agg_intox_accidental4, 
+                                   filtro_etario = "0 a 4 años",
+                                   filtro_toxico = "Plaguicidas y otros quimicos")
+(acc_plag_prop <- sum(acc_plag_0_4$ts_full)/nrow(intox_accidental))
+
+acc_plag_0_4_tsibble <- acc_plag_0_4$agg_data %>% 
+  as_tsibble(index = TIEMPO) %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO))
+
+acc_plag_0_4_train <- acc_plag_0_4_tsibble %>% 
+  filter(TIEMPO < tsibble::yearmonth("2020-03"))
+acc_plag_0_4_test <- acc_plag_0_4_tsibble %>% 
+  filter(TIEMPO >= tsibble::yearmonth("2020-03"))
+```
+  
+#### Changepoint - Enfoque cambio de nivel
+
+```{r}
+acc_plag_cpts <- get_change_points(acc_plag_0_4$ts_full)
+acc_plag_cpts$cp_plot
+```
+  
+#### Outliers - Enfoque de valores extremos  
+  
+```{r}
+acc_plag_outliers <- forecast::tsoutliers(acc_plag_0_4$ts_full, lambda = NULL, iterate = 100)
+zoo::as.Date(acc_plag_0_4$ts_full)[acc_plag_outliers$index]
+```
+  
+### ARIMA - Enfoque Intervencion  
+  
+#### Estacionariedad y Autocorrelogramas Intervención   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+# DescTools::PlotACF(acc_plag_0_4$ts_full, main = "")
+
+acc_plag_0_4_tsibble %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+acc_plag_0_4_tsibble |>
+  features(TOTAL, unitroot_nsdiffs)
+
+acc_plag_0_4_tsibble |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+acc_plag_0_4_tsibble |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+acc_plag_0_4_tsibble |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+acc_plag_0_4_tsibble |>
+  gg_tsdisplay_spanish(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+acc_plag_0_4_tsibble |>
+  gg_tsdisplay_spanish(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  labs(title = "Diferenciado", y="")
+```  
+  
+#### Modelaje Intervención  
+  
+##### Selección del Modelo  
+  
+```{r}
+inter <- c(rep(0, 62), rep(1, 34))
+timeperiod <- 96
+# 
+# acc_plag_0_4_inter_model <- acc_plag_0_4_tsibble %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL ~ inter, stepwise=FALSE, approximation=FALSE))
+
+acc_plag_0_4_inter_model <- acc_plag_0_4_tsibble %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_200_100_12_auto = ARIMA(TOTAL ~ pdq(2,0,0) + inter + PDQ(1,0,0, period = 12)),
+    arima_010 = ARIMA(TOTAL ~ pdq(0,1,0) + inter + PDQ(0,0,0)),
+    arima_011 = ARIMA(TOTAL ~ pdq(0,1,1) + inter + PDQ(0,0,0)),
+    arima_110 = ARIMA(TOTAL ~ pdq(1,1,0) + inter + PDQ(0,0,0)),
+    arima_111 = ARIMA(TOTAL ~ pdq(1,1,1) + inter + PDQ(0,0,0)),
+    arima_012 = ARIMA(TOTAL ~ pdq(2,1,0) + inter + PDQ(0,0,0)),
+    arima_210 = ARIMA(TOTAL ~ pdq(2,1,1) + inter + PDQ(0,0,0)),
+
+    arima_010_100_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 6) + inter),
+    arima_011_100_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 6) + inter),
+    arima_110_100_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 6) + inter),
+    arima_111_100_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 6) + inter),
+    arima_012_100_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,0, period = 6) + inter),
+    arima_210_100_6 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,0, period = 6) + inter),
+    
+    arima_010_001_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_011_001_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,1, period = 6) + inter),
+    arima_110_001_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_111_001_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,1, period = 6) + inter),
+    arima_012_001_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,1, period = 6) + inter),
+    arima_210_001_6 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,1, period = 6) + inter),
+    
+    arima_010_001_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_011_001_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,1, period = 12) + inter),
+    arima_110_001_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_111_001_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,1, period = 12) + inter),
+    arima_012_001_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,1, period = 12) + inter),
+    arima_210_001_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,1, period = 12) + inter),
+    
+    arima_010_002_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,2, period = 6) + inter),
+    arima_011_002_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,2, period = 6) + inter),
+    arima_110_002_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,2, period = 6) + inter),
+    arima_111_002_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,2, period = 6) + inter),
+    arima_012_002_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,2, period = 6) + inter),
+    arima_210_002_6 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,2, period = 6) + inter),
+    
+    arima_010_101_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,1, period = 6) + inter),
+    arima_011_101_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,1, period = 6) + inter),
+    arima_110_101_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,1, period = 6) + inter),
+    arima_111_101_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,1, period = 6) + inter),
+    arima_012_101_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,1, period = 6) + inter),
+    arima_210_101_6 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,1, period = 6) + inter),
+    
+    arima_010_101_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,1, period = 12) + inter),
+    arima_011_101_12 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,1, period = 12) + inter),
+    arima_110_101_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,1, period = 12) + inter),
+    arima_111_101_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,1, period = 12) + inter),
+    arima_012_101_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,1, period = 12) + inter),
+    arima_210_101_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,1, period = 12) + inter)
+  )
+
+acc_plag_0_4_inter_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(acc_plag_0_4_inter_model) |> 
+  arrange(AICc) |> 
+  select(.model:BIC)
+
+acc_plag_0_4_inter_sel_model <- acc_plag_0_4_inter_model |>
+  select(arima_011_101_12)
+
+acc_plag_0_4_inter_sel_model |>
+  report()
+
+acc_plag_0_4_inter_sel_model |> 
+  gg_tsresiduals(lag=timeperiod)
+```
+  
+##### Verificación de Supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(acc_plag_0_4_inter_lb <- augment(acc_plag_0_4_inter_model) |>
+  filter(.model == "arima_011_101_12") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 3))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+  
+###### Raíces Unitarias  
+  
+```{r}
+acc_plag_0_4_inter_sel_model |> 
+  gg_arma()
+```
+  
+###### Normalidad de los residuos  
+  
+```{r}
+# Normalidad de Residuos - ARIMA
+acc_plag_0_4_inter_ts_residuals <- residuals(acc_plag_0_4_inter_sel_model, 
+                                    type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(acc_plag_0_4_inter_ts_residuals)
+
+(acc_plag_0_4_inter_jb_arima <- tseries::jarque.bera.test(acc_plag_0_4_inter_ts_residuals))
+
+(acc_plag_0_4_inter_shap_arima <-shapiro.test(acc_plag_0_4_inter_ts_residuals))
+
+car::qqPlot(acc_plag_0_4_inter_ts_residuals)
+
+# Normalidad de residuos - Regresion
+acc_plag_0_4_inter_reg_residuals <- residuals(acc_plag_0_4_inter_sel_model, type = "regression") %>% as_tibble() %>% pull(.resid)
+
+mean(acc_plag_0_4_inter_reg_residuals)
+
+(acc_plag_0_4_inter_shap_reg <- shapiro.test(acc_plag_0_4_inter_reg_residuals))
+
+car::qqPlot(acc_plag_0_4_inter_reg_residuals)
+
+# Visualizacion ambos graficos
+bind_rows(
+    `Regression residuals` =
+        as_tibble(residuals(acc_plag_0_4_inter_sel_model, type = "regression")),
+    `ARIMA residuals` =
+        as_tibble(residuals(acc_plag_0_4_inter_sel_model, type = "innovation")),
+    .id = "type"
+  ) |>
+  mutate(
+    TIEMPO = as_date(TIEMPO)
+  ) |>
+  ggplot(aes(x = TIEMPO, y = .resid)) +
+  geom_line() +
+  facet_grid(vars(type))
+```
+  
+##### Agrupación de resultados  
+  
+```{r}
+(summary_int_arima_mods <- bind_rows(
+  summary_int_arima_mods,
+  tibble(
+    Modelo = "Regresion con ARIMA (0,1,1)(1,0,1)[12]",
+    Significancia_intervencion = "No",
+    ACF_Residuales = "Todos dentro",
+    Histograma = "Aproximadamente Normal con cola",
+    Residuals_LJung_Box_Test_ARIMA = round(acc_plag_0_4_inter_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(acc_plag_0_4_inter_jb_arima$p.value, 2),
+    Residuals_Shapiro_Test_ARIMA = round(acc_plag_0_4_inter_shap_arima$p.value, 2),
+    Residuals_Jarque_Bera_Regression = round(acc_plag_0_4_inter_shap_reg$p.value, 2)
+  )))
+```
+  
+#### ARIMA - Enfoque Pronostico  
+  
+#### Estacionariedad y Autocorrelogramas Pronóstico   
+  
+```{r}
+# Basado en los resultados del grafico no parece existir necesidad de diferenciar
+acc_plag_0_4_train %>% 
+  features(TOTAL, ljung_box, lag = 10)
+#===============================================================================
+# Primero se verifica la cantidad de diferenciaciones para seasonality
+acc_plag_0_4_train |>
+  features(TOTAL, unitroot_nsdiffs)
+
+acc_plag_0_4_train |>
+  features(TOTAL, feat_stl, 12) # si el seasonal strength es menor a 0.64 se considera que no es necesaria la diferenciacion estacional
+#===============================================================================
+# Diferenciacion de primer orden
+acc_plag_0_4_train |>
+  features(TOTAL, unitroot_ndiffs) #indica el numero de diferenciaciones requeridas
+
+acc_plag_0_4_train |>
+  features(TOTAL, unitroot_kpss)
+
+# p value está reportafo entre 0.01 y 0.1, si es mayor o menor asume el valor de los limites
+# If the null hypothesis is rejected, the data are not stationary (p <= 0.05). We can difference the data, and apply the test again.
+
+acc_plag_0_4_train |>
+  gg_tsdisplay_spanish(TOTAL, plot_type='partial', lag=36) +
+  labs(title = "Original", y="")
+
+acc_plag_0_4_train |>
+  gg_tsdisplay_spanish(difference(TOTAL),
+               plot_type='partial', lag=36) +
+  labs(title = "Diferenciado", y="")  
+```    
+  
+#### Modelaje Pronóstico     
+  
+##### Selección del Modelo  
+  
+```{r}
+# acc_plag_0_4_pron_model <- acc_plag_0_4_train %>%
+#   mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>%
+#   model(ARIMA(TOTAL, stepwise=FALSE, approximation=FALSE))
+
+# acc_plag_0_4_pron_model |>
+#   pivot_longer(everything(),
+#                names_to = "Model name",
+#                values_to = "Orders")
+
+acc_plag_0_4_pron_model <- acc_plag_0_4_train %>% 
+  mutate(TIEMPO = tsibble::yearmonth(TIEMPO)) %>% 
+  model(
+    arima_010 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(0,0,0)),
+    arima_011 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(0,0,0)),
+    arima_110 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(0,0,0)),
+    arima_111 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(0,0,0)),
+    arima_012 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(0,0,0)),
+    arima_210 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(0,0,0)),
+
+    arima_010_100_6 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 6)),
+    arima_011_100_6 = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 6)),
+    arima_110_100_6 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 6)),
+    arima_111_100_6 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 6)),
+    arima_012_100_6 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,0, period = 6)),
+    arima_210_100_6 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,0, period = 6)),
+    
+    arima_010_100_12 = ARIMA(TOTAL ~ pdq(0,1,0) + PDQ(1,0,0, period = 12)),
+    arima_011_100_12_auto = ARIMA(TOTAL ~ pdq(0,1,1) + PDQ(1,0,0, period = 12)),
+    arima_110_100_12 = ARIMA(TOTAL ~ pdq(1,1,0) + PDQ(1,0,0, period = 12)),
+    arima_111_100_12 = ARIMA(TOTAL ~ pdq(1,1,1) + PDQ(1,0,0, period = 12)),
+    arima_012_100_12 = ARIMA(TOTAL ~ pdq(2,1,0) + PDQ(1,0,0, period = 12)),
+    arima_210_100_12 = ARIMA(TOTAL ~ pdq(2,1,1) + PDQ(1,0,0, period = 12))
+  )
+
+acc_plag_0_4_pron_model |> 
+  pivot_longer(everything(), 
+               names_to = "Model name",
+               values_to = "Orders")
+
+glance(acc_plag_0_4_pron_model) |> 
+  arrange(AICc) |> 
+  select(.model:BIC)
+
+acc_plag_0_4_final_arima_model <- acc_plag_0_4_pron_model |>
+  select(arima_011) 
+
+# arima_011_100_12_auto componente estacional no significativo
+
+acc_plag_0_4_final_arima_model |>
+  report()
+
+acc_plag_0_4_final_arima_model |> 
+  gg_tsresiduals(lag=timeperiod)
+```
+  
+##### Verificación de supuestos  
+  
+###### Ausencia de autocorrelaciones en los residuales  
+  
+```{r}
+(acc_plag_0_4_lb <-  augment(acc_plag_0_4_pron_model) |>
+  filter(.model == "arima_011") |>
+  features(.innov, ljung_box, lag = 10, #24
+           dof = 1))
+#DOF SDEBE SER IGUAL A LA SUMA DE AR Y MA PARAMETROS EN EL MODELO
+# The large p-value confims that the residuals are similar to white noise.
+```
+   
+###### Raíces Unitarias
+   
+```{r}
+acc_plag_0_4_final_arima_model |> 
+  gg_arma()
+```
+   
+###### Normalidad de los residuos   
+   
+```{r}
+# Normalidad de Residuos - ARIMA
+acc_plag_0_4_residuals <- residuals(acc_plag_0_4_final_arima_model, type = "innovation") %>% 
+                            as_tibble() %>% pull(.resid)
+
+mean(acc_plag_0_4_residuals)
+
+(acc_plag_0_4_jb_arima <- tseries::jarque.bera.test(acc_plag_0_4_residuals))
+
+(acc_plag_0_4_shap_arima <- shapiro.test(acc_plag_0_4_residuals))
+
+car::qqPlot(acc_plag_0_4_residuals)
+```
+   
+##### Agrupación de Resultados   
+   
+```{r}
+acc_plag_0_4_pron <- gen_pronostic_plot2(acc_plag_0_4_train, 
+                                      acc_plag_0_4_test,
+                                      acc_plag_0_4_final_arima_model,
+                                      h_forecast = 34)
+
+acc_plag_0_4_arima_sel_df <- forecast::accuracy(acc_plag_0_4_pron$pron_df$yhat,
+                                                    acc_plag_0_4_pron$pron_df$y) %>%
+  as_tibble() %>% 
+  mutate(Modelo = "ARIMA (0,1,1)",
+         Metric_Type = "Test set")
+
+summary_pron_arima_mods <- bind_rows(
+  summary_pron_arima_mods,
+  tibble(
+    Modelo = "ARIMA (0,1,1)",
+    ACF_Residuales = "Todos dentro",
+    Histograma = "Sesgado a la derecha",
+    Residuals_LJung_Box_Test_ARIMA = round(acc_plag_0_4_lb$lb_pvalue, 2),
+    Residuals_Jarque_Bera_ARIMA = round(acc_plag_0_4_jb_arima$p.value, 2),
+    Residuals_Shapiro_Test_ARIMA = round(acc_plag_0_4_shap_arima$p.value, 2)
+  ))
+```
+  
+#### Prophet - Enfoque Pronóstico
+  
+```{r}
+# acc_plag_prophet_mod <- generate_prophet_forecast(acc_plag_0_4$ts_train,
+#                                               acc_plag_0_4$ts_test,
+#                                               periods = 34)
+# write_rds(acc_plag_prophet_mod, "modelos/acc_plag_0_4_prophet.RDS")
+acc_plag_prophet <- readRDS("modelos/acc_plag_0_4_prophet.RDS")
+
+acc_plag_sel_prophet <- 2
+acc_plag_prophet_plot <- generate_prophet_plot(acc_plag_0_4$ts_train, 
+                      acc_plag_0_4$ts_test, 
+                      forecast_tb = acc_plag_prophet$forecast_tb_list[[acc_plag_sel_prophet]])
+
+combine_model_metrics(acc_plag_0_4_arima_sel_df, 
+                      acc_plag_prophet$acc_consolidated[acc_plag_sel_prophet,]) %>% 
+  arrange(RMSE, MAPE)
+```
+  
+#### Gráficos de pronóstico
+  
+```{r}
+cowplot::plot_grid(acc_plag_0_4_pron$arima_plot, 
+                   acc_plag_prophet_plot, 
+                   labels = c('Arima', 'Prophet'))
+``` 
+  
+```{r}
+write_csv(summary_int_arima_mods, "1.accidental_summary_int_arima_mods.csv")
+write_csv(summary_pron_arima_mods, "1.accidental_summary_pron_arima_mods.csv")
+```
+  
+  
